@@ -1,0 +1,439 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>BOOKUS 낭독 녹음</title>
+<script src="https://aka.ms/csspeech/jsbrowserpackageraw"></script>
+<script>
+/* aka.ms 는 리디렉터라 일부 학교·학원 망에서 막히는 경우가 있다.
+   기본 경로가 실패하면 npm CDN(버전 고정)에서 같은 SDK를 받는다.
+   아래 진단 패널의 "Azure SDK" 항목이 둘 다 실패했는지 알려 준다. */
+if (!window.SpeechSDK) {
+  document.write('<scr' + 'ipt src="https://cdn.jsdelivr.net/npm/microsoft-cognitiveservices-speech-sdk@1.52.0'
+    + '/distrib/browser/microsoft.cognitiveservices.speech.sdk.bundle-min.js"><\/scr' + 'ipt>');
+}
+</script>
+<style>
+  :root{--ac:#2e6b4f;--acd:#1f4c38;--bd:#d8dfe6;--bg:#f4f7fa;--warn:#b23;--ok:#137a3a}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:'Apple SD Gothic Neo','Noto Sans KR',-apple-system,sans-serif;
+       background:var(--bg);color:#1a2230;padding:16px;-webkit-text-size-adjust:100%}
+  h1{font-size:1.05rem;margin:0 0 4px;color:var(--acd)}
+  .sub{font-size:.78rem;color:#7b8794;margin-bottom:12px}
+  .card{background:#fff;border:1px solid var(--bd);border-radius:12px;padding:14px;margin-bottom:12px}
+  .ref{font-size:.95rem;line-height:1.75;background:#fbfaf3;border:1px solid #e6dfae;
+       border-radius:8px;padding:12px;max-height:190px;overflow:auto}
+  .ref b{background:#fff3b0;border-radius:3px;padding:0 2px}
+  button{width:100%;border:none;border-radius:11px;padding:14px;font-size:1rem;
+         font-weight:800;cursor:pointer;font-family:inherit}
+  #btnRec{background:var(--ac);color:#fff}
+  #btnRec.rec{background:var(--warn)}
+  #btnRec:disabled{background:#b7c3bf;cursor:not-allowed}
+  .ghost{background:#fff;border:1.5px solid var(--bd);color:#55606e;margin-top:8px}
+  .lv{height:8px;background:#e7ecf1;border-radius:4px;overflow:hidden;margin:10px 0 2px}
+  .lv > i{display:block;height:100%;width:0;background:var(--ac);transition:width .08s}
+  .stat{font-size:.82rem;color:#55606e;text-align:center;margin-top:6px;min-height:1.2em}
+  .scores{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:10px 0}
+  .sc{background:#f0f5fa;border:1px solid #cfdbe7;border-radius:9px;padding:9px 4px;text-align:center}
+  .sc b{display:block;font-size:1.25rem;color:var(--acd)}
+  .sc span{font-size:.68rem;color:#7b8794}
+  .words{font-size:.9rem;line-height:2.1}
+  .w-ok{color:#2b3a4a}
+  .w-bad{background:#ffe0e0;color:#b23;border-radius:3px;padding:1px 4px;font-weight:700}
+  .w-mid{background:#fff3cd;color:#8a6100;border-radius:3px;padding:1px 4px}
+  .w-om{color:#aab3bd;text-decoration:line-through}
+  details{margin-top:10px}
+  summary{font-size:.8rem;color:#7b8794;cursor:pointer}
+  pre{font-size:.68rem;background:#0f1720;color:#cfe3d6;padding:10px;border-radius:8px;
+      overflow:auto;max-height:230px;white-space:pre-wrap;word-break:break-all}
+  .diag{font-size:.74rem;line-height:1.85;color:#55606e}
+  .diag i{font-style:normal;display:inline-block;min-width:118px;color:#98a3af}
+  .pill{display:inline-block;font-size:.7rem;padding:2px 7px;border-radius:20px;font-weight:700}
+  .p-ok{background:#e7f7ec;color:var(--ok)} .p-no{background:#ffe5e5;color:var(--warn)}
+  .p-wait{background:#eef1f5;color:#7b8794}
+  label{font-size:.78rem;color:#55606e;display:block;margin-bottom:4px}
+  input,textarea{width:100%;border:1px solid var(--bd);border-radius:8px;padding:8px;
+                 font-size:.82rem;font-family:inherit}
+</style>
+</head>
+<body>
+
+<h1>🎤 BOOKUS 낭독 녹음</h1>
+<div class="sub" id="subTitle">마이크 브리지 검증본 (0단계)</div>
+
+<!-- 지문 -->
+<div class="card">
+  <div class="ref" id="ref">지문을 기다리는 중…</div>
+</div>
+
+<!-- 녹음 -->
+<div class="card">
+  <button id="btnRec" disabled>준비 중…</button>
+  <div class="lv"><i id="lvBar"></i></div>
+  <div class="stat" id="stat">&nbsp;</div>
+  <button class="ghost" id="btnSkip" style="display:none;border-color:#e6c07a;color:#8a6100">
+    낭독 없이 계속하기 →
+  </button>
+  <button class="ghost" id="btnClose">닫기</button>
+</div>
+
+<!-- 결과 -->
+<div class="card" id="cardRes" style="display:none">
+  <div class="scores">
+    <div class="sc"><b id="sPron">–</b><span>종합</span></div>
+    <div class="sc"><b id="sAcc">–</b><span>정확도</span></div>
+    <div class="sc"><b id="sFlu">–</b><span>유창성</span></div>
+    <div class="sc"><b id="sCom">–</b><span>완독률</span></div>
+  </div>
+  <div class="words" id="words"></div>
+  <button class="ghost" id="btnSend">이 결과로 제출하기 →</button>
+  <details><summary>원시 응답 보기(디버그)</summary><pre id="raw"></pre></details>
+</div>
+
+<!-- 진단 -->
+<div class="card">
+  <div class="diag" id="diag"></div>
+  <details id="soloBox" style="display:none">
+    <summary>단독 테스트 모드 — 토큰 직접 입력</summary>
+    <div style="margin-top:8px">
+      <label>Azure 지역 (예: koreacentral)</label>
+      <input id="inRegion" value="koreacentral">
+      <label style="margin-top:6px">인증 토큰 또는 구독키</label>
+      <input id="inToken" placeholder="issueToken 결과 또는 Speech 키">
+      <label style="margin-top:6px">지문</label>
+      <textarea id="inRef" rows="3">A cat jumped down from a tree. He went into a big box. The cat could not get out.</textarea>
+      <button class="ghost" id="btnSolo" style="margin-top:8px">이 설정으로 시작</button>
+    </div>
+  </details>
+</div>
+
+<script>
+/* =========================================================================
+   BOOKUS 낭독 녹음 페이지 (외부 출처 호스팅 전용)
+   ------------------------------------------------------------------------
+   왜 이 페이지가 따로 있나:
+     구글 앱스스크립트 웹앱은 샌드박스 아이프레임 안에서 돌아가는데, 구글이
+     그 프레임의 권한에서 마이크를 빼놨다. 그래서 학습앱 안에서 getUserMedia를
+     부르면 무조건 "Permissions policy violation"으로 막힌다.
+     팝업 창은 부모 프레임의 제약을 받지 않고 자기 출처의 권한을 그대로 쓰므로,
+     녹음만 이 페이지에서 하고 '점수'만 학습앱으로 돌려준다.
+     음성 자체는 브라우저 → Azure로 직행하며 학습앱/시트에는 닿지 않는다.
+
+   주고받는 메시지 (postMessage):
+     이 페이지 → 학습앱 : REC_READY  (준비됨, 토큰 요청)
+     학습앱 → 이 페이지 : REC_INIT   {token, region, referenceText, label}
+     이 페이지 → 학습앱 : REC_RESULT {payload:{scores, words, ...}}
+     이 페이지 → 학습앱 : REC_CANCEL
+   ========================================================================= */
+
+/* ▼▼ 배포 전 반드시 학습앱 주소로 바꾸세요 ▼▼
+   앱스스크립트 웹앱은 googleusercontent 도메인에서 렌더링되므로 둘 다 허용합니다. */
+var ALLOW_ORIGINS = [
+  'https://script.google.com',
+  'https://n-nlhgkdzqjqjqjqjqjqj-0lu-script.googleusercontent.com'  // 예시 — 실제 값으로 교체
+];
+/* 검증 단계에서는 아래를 true로 두면 출처 검사를 완화합니다. 운영 전환 시 반드시 false. */
+var DEV_RELAX_ORIGIN = true;
+
+var SDK = window.SpeechSDK;
+var CFG = { token:'', region:'', ref:'', label:'' };
+var recognizer = null, running = false, startedAt = 0, levelTimer = null;
+var segs = [];               // 구간별 결과 누적
+var parentOrigin = null;
+
+var $ = function(id){ return document.getElementById(id); };
+
+/* ---------- 진단 패널 ---------- */
+function pill(ok, txt){ return '<span class="pill '+(ok===null?'p-wait':(ok?'p-ok':'p-no'))+'">'+txt+'</span>'; }
+var D = { sdk:null, mic:null, token:null, secure:null, opener:null };
+function drawDiag(){
+  var ua = navigator.userAgent;
+  var os = /iPhone|iPad|iPod/.test(ua)?'iOS':/Android/.test(ua)?'Android':
+           /Mac/.test(ua)?'macOS':/Windows/.test(ua)?'Windows':'기타';
+  var br = /CriOS|Chrome/.test(ua)?'Chrome':/FxiOS|Firefox/.test(ua)?'Firefox':
+           /EdgiOS|Edg/.test(ua)?'Edge':/Safari/.test(ua)?'Safari':'기타';
+  $('diag').innerHTML =
+     '<i>기기 / 브라우저</i> '+os+' · '+br+'<br>'
+   + '<i>HTTPS(보안)</i> '+pill(D.secure, D.secure?'정상':'아님')+'<br>'
+   + '<i>Azure SDK</i> '+pill(D.sdk, D.sdk===null?'확인 중':(D.sdk?'로드됨':'실패'))+'<br>'
+   + '<i>학습앱 연결</i> '+pill(D.opener, D.opener===null?'대기':(D.opener?'연결됨':'단독 실행'))+'<br>'
+   + '<i>토큰</i> '+pill(D.token, D.token===null?'대기':(D.token?'수신':'없음'))+'<br>'
+   + '<i>마이크 권한</i> '+pill(D.mic, D.mic===null?'미요청':(D.mic?'허용됨':'거부/실패'));
+}
+
+/* ---------- 초기화 ---------- */
+D.secure = (location.protocol === 'https:' || location.hostname === 'localhost');
+D.sdk = !!(SDK && SDK.SpeechConfig);
+D.opener = !!(window.opener && window.opener !== window);
+drawDiag();
+
+if (!D.opener) { $('soloBox').style.display = 'block'; $('stat').textContent = '단독 실행 — 아래에서 토큰을 넣어 테스트하세요.'; }
+if (!D.sdk) { $('stat').innerHTML = '<span style="color:#b23">Azure 음성 SDK를 불러오지 못했습니다. 네트워크/차단 확인.</span>'; }
+
+/* 학습앱에 "준비됐다"고 알리고 토큰을 요청 */
+if (D.opener) {
+  try { window.opener.postMessage({ type:'REC_READY' }, '*'); } catch(e){}
+}
+
+window.addEventListener('message', function(e){
+  if (!DEV_RELAX_ORIGIN && ALLOW_ORIGINS.indexOf(e.origin) === -1) return;
+  var d = e.data || {};
+  if (d.type === 'REC_INIT') {
+    parentOrigin = e.origin;
+    CFG.token = d.token || ''; CFG.region = d.region || 'koreacentral';
+    CFG.ref = String(d.referenceText || '').trim(); CFG.label = d.label || '';
+    D.token = !!CFG.token; drawDiag();
+    if (CFG.label) $('subTitle').textContent = CFG.label;
+    showRef(CFG.ref);
+    $('btnRec').disabled = !(D.sdk && CFG.token && CFG.ref);
+    $('btnRec').textContent = '🎤 녹음 시작';
+    $('stat').textContent = '버튼을 누르고 지문을 소리 내어 읽어 주세요.';
+  } else if (d.type === 'REC_ERROR') {
+    $('stat').innerHTML = '<span style="color:#b23">'+ (d.message||'오류') +'</span>';
+  }
+});
+
+function showRef(t){ $('ref').textContent = t || '(지문 없음)'; }
+
+/* ---------- 실패를 학습앱에 알린다 (학생이 관문에 갇히지 않게) ----------
+   이게 없으면 학습앱은 "학생이 그냥 창을 닫았다"로만 알게 되어
+   낭독 요건이 풀리지 않고 관문이 잠긴 채로 남는다. */
+var FAILED = false;
+function failParent(reason, detail){
+  if (FAILED) return; FAILED = true;
+  if (D.opener) {
+    try { window.opener.postMessage({ type:'REC_FAIL', reason:reason,
+            message:String(detail||'') }, parentOrigin||'*'); } catch(e){}
+  }
+  /* 화면도 확실히 되돌린다. SDK가 실패를 알린 뒤에도 start 성공 콜백이 늦게 들어와
+     "듣고 있어요…"로 덮어쓰는 경우가 있어서, 여기서 상태를 확정한다. */
+  running = false;
+  clearTimeout(window.__deaf__);
+  stopLevelMeter();
+  var b = $('btnRec');
+  b.classList.remove('rec'); b.disabled = false; b.textContent = '🎤 다시 시도';
+  $('btnSkip').style.display = '';          // 학생이 빠져나갈 길을 항상 열어 둔다
+}
+$('btnSkip').addEventListener('click', function(){
+  failParent('skipped_by_student', '');
+  window.close();
+});
+
+/* 단독 테스트 모드 */
+$('btnSolo').addEventListener('click', function(){
+  CFG.region = $('inRegion').value.trim() || 'koreacentral';
+  CFG.token  = $('inToken').value.trim();
+  CFG.ref    = $('inRef').value.trim();
+  D.token = !!CFG.token; drawDiag(); showRef(CFG.ref);
+  $('btnRec').disabled = !(D.sdk && CFG.token && CFG.ref);
+  $('btnRec').textContent = '🎤 녹음 시작';
+  $('stat').textContent = '단독 모드 준비 완료.';
+});
+
+/* ---------- 녹음 + 발음평가 ---------- */
+$('btnRec').addEventListener('click', function(){ running ? stopRec() : startRec(); });
+$('btnClose').addEventListener('click', function(){
+  if (D.opener) { try { window.opener.postMessage({type:'REC_CANCEL'}, parentOrigin||'*'); } catch(e){} }
+  window.close();
+});
+
+function makeSpeechConfig(){
+  /* 토큰(권장) 또는 구독키 둘 다 받아준다 — 토큰은 보통 길고 점(.)이 들어간다 */
+  var sc;
+  if (CFG.token.length > 120 || CFG.token.indexOf('.') !== -1) {
+    sc = SDK.SpeechConfig.fromAuthorizationToken(CFG.token, CFG.region);
+  } else {
+    sc = SDK.SpeechConfig.fromSubscription(CFG.token, CFG.region);
+  }
+  sc.speechRecognitionLanguage = 'en-US';
+  /* 문장 중간의 짧은 숨·머뭇거림에서 구간이 끊기지 않도록 침묵 허용치를 늘린다 */
+  try { sc.setProperty(SDK.PropertyId.Speech_SegmentationSilenceTimeoutMs, '1200'); } catch(e){}
+  return sc;
+}
+
+function startRec(){
+  if (!D.sdk || !CFG.token || !CFG.ref) return;
+  segs = []; $('cardRes').style.display='none';
+  FAILED = false;                       /* 다시 시도하면 판정을 초기화한다 */
+  $('stat').textContent = '마이크 권한을 확인하는 중…';
+
+  /* 권한을 먼저 명시적으로 받아 진단에 남긴다(iOS는 사용자 제스처 안에서 호출돼야 함) */
+  navigator.mediaDevices.getUserMedia({ audio:true }).then(function(stream){
+    D.mic = true; drawDiag();
+    startLevelMeter(stream);
+    beginRecognition();
+  }).catch(function(err){
+    D.mic = false; drawDiag();
+    $('stat').innerHTML = '<span style="color:#b23">마이크를 열 수 없습니다: '
+      + (err && err.name ? err.name : '오류')
+      + '<br>브라우저 주소창의 마이크 권한을 허용해 주세요.</span>';
+    failParent('mic_denied', err && err.name);   /* 학습앱이 낭독 요건을 풀도록 */
+  });
+}
+
+function beginRecognition(){
+  var sc = makeSpeechConfig();
+  var ac = SDK.AudioConfig.fromDefaultMicrophoneInput();
+  recognizer = new SDK.SpeechRecognizer(sc, ac);
+
+  var pa = new SDK.PronunciationAssessmentConfig(
+    CFG.ref,
+    SDK.PronunciationAssessmentGradingSystem.HundredMark,
+    SDK.PronunciationAssessmentGranularity.Phoneme,
+    true                      /* enableMiscue: 누락·삽입 단어를 잡아준다 */
+  );
+  pa.applyTo(recognizer);
+
+  recognizer.recognized = function(s, e){
+    if (e.result.reason !== SDK.ResultReason.RecognizedSpeech) return;
+    try {
+      var js = e.result.properties.getProperty(SDK.PropertyId.SpeechServiceResponse_JsonResult);
+      var nb = JSON.parse(js).NBest[0];
+      segs.push(nb);
+      $('stat').textContent = '인식 중… ' + segs.length + '구간 (' + elapsed() + '초)';
+    } catch(err){}
+  };
+  recognizer.canceled = function(s, e){
+    var msg = (e && (e.errorDetails || e.reason)) || '알 수 없는 오류';
+    /* 채점 결과를 이미 받은 뒤의 정상 종료(EndOfStream)는 실패가 아니다 */
+    if (segs.length) { stopRec(true); render(); return; }
+    $('stat').innerHTML = '<span style="color:#b23">채점 서버에 연결하지 못했습니다.<br>'
+      + '<span style="font-size:.9em;color:#7b8794">' + String(msg).slice(0,120) + '</span></span>';
+    stopRec(true);
+    failParent('azure_failed', msg);
+  };
+
+  recognizer.startContinuousRecognitionAsync(function(){
+    if (FAILED) return;              /* 이미 실패로 판정된 뒤 늦게 도착한 콜백은 무시 */
+    running = true; startedAt = Date.now();
+    $('btnRec').textContent = '■ 다 읽었어요'; $('btnRec').classList.add('rec');
+    $('stat').textContent = '듣고 있어요… 지문을 소리 내어 읽어 주세요.';
+    /* 25초가 지나도록 한 구간도 못 받으면 채점이 안 되고 있는 것이다 */
+    clearTimeout(window.__deaf__);
+    window.__deaf__ = setTimeout(function(){
+      if (running && !segs.length) {
+        $('stat').innerHTML = '<span style="color:#b23">소리가 인식되지 않고 있어요. '
+          + '마이크를 확인하거나 아래 버튼으로 계속 진행하세요.</span>';
+        failParent('no_speech', '25s silent');
+      }
+    }, 25000);
+  }, function(err){
+    $('stat').innerHTML = '<span style="color:#b23">시작 실패: '+err+'</span>';
+    failParent('start_failed', err);
+  });
+}
+
+function elapsed(){ return Math.round((Date.now()-startedAt)/1000); }
+
+function stopRec(silent){
+  if (!recognizer) return;
+  running = false; clearTimeout(window.__deaf__);
+  $('btnRec').textContent = '채점 중…'; $('btnRec').classList.remove('rec'); $('btnRec').disabled = true;
+  stopLevelMeter();
+  recognizer.stopContinuousRecognitionAsync(function(){
+    try { recognizer.close(); } catch(e){}
+    recognizer = null;
+    if (!silent) render();
+    $('btnRec').disabled = false; $('btnRec').textContent = '🎤 다시 녹음';
+  }, function(){ $('btnRec').disabled = false; $('btnRec').textContent = '🎤 다시 녹음'; });
+}
+
+/* ---------- 구간 결과 합산 ---------- */
+function aggregate(){
+  var words = [], fluSum = 0, fluW = 0;
+  segs.forEach(function(nb){
+    var ws = nb.Words || [];
+    ws.forEach(function(w){ words.push(w); });
+    var f = nb.PronunciationAssessment && nb.PronunciationAssessment.FluencyScore;
+    if (typeof f === 'number') { fluSum += f * Math.max(1, ws.length); fluW += Math.max(1, ws.length); }
+  });
+  var refN = CFG.ref.split(/\s+/).filter(Boolean).length;
+  var scored = words.filter(function(w){
+    var t = w.PronunciationAssessment && w.PronunciationAssessment.ErrorType;
+    return t !== 'Omission' && t !== 'Insertion';
+  });
+  var accSum = scored.reduce(function(a,w){
+    return a + ((w.PronunciationAssessment && w.PronunciationAssessment.AccuracyScore) || 0); }, 0);
+  var accuracy = scored.length ? accSum/scored.length : 0;
+  var fluency  = fluW ? fluSum/fluW : 0;
+  var completeness = refN ? Math.min(100, scored.length / refN * 100) : 0;
+  /* Azure 종합점수 가중치와 같은 비율(정확 0.6 · 유창 0.2 · 완독 0.2) */
+  var pron = accuracy*0.6 + fluency*0.2 + completeness*0.2;
+  return { accuracy:accuracy, fluency:fluency, completeness:completeness, pron:pron,
+           words:words, refWordCount:refN, spokenWordCount:scored.length, seconds:elapsed() };
+}
+
+function render(){
+  if (!segs.length) {
+    $('stat').innerHTML = '<span style="color:#b23">인식된 말이 없습니다. 마이크 입력을 확인하고 다시 시도해 주세요.</span>';
+    failParent('no_speech', 'empty result');   /* 다시 시도해도 되고, 그냥 진행해도 된다 */
+    return;
+  }
+  var r = aggregate();
+  var R = function(x){ return Math.round(x); };
+  $('sPron').textContent = R(r.pron);  $('sAcc').textContent = R(r.accuracy);
+  $('sFlu').textContent = R(r.fluency); $('sCom').textContent = R(r.completeness);
+
+  $('words').innerHTML = r.words.map(function(w){
+    var p = w.PronunciationAssessment || {}, t = p.ErrorType, a = p.AccuracyScore || 0;
+    var cls = (t === 'Omission') ? 'w-om' : (t && t !== 'None') ? 'w-bad'
+            : (a < 60) ? 'w-bad' : (a < 80) ? 'w-mid' : 'w-ok';
+    return '<span class="'+cls+'" title="'+R(a)+'">'+ (w.Word||'') +'</span>';
+  }).join(' ');
+
+  $('raw').textContent = JSON.stringify({ scores:{
+      pron:R(r.pron), accuracy:R(r.accuracy), fluency:R(r.fluency), completeness:R(r.completeness)
+    }, seconds:r.seconds, refWordCount:r.refWordCount, spokenWordCount:r.spokenWordCount,
+    segments:segs.length }, null, 1);
+
+  $('cardRes').style.display = 'block';
+  $('stat').textContent = '완료 — ' + r.seconds + '초 · ' + segs.length + '구간';
+  window.__LAST__ = r;
+}
+
+$('btnSend').addEventListener('click', function(){
+  var r = window.__LAST__; if (!r) return;
+  var payload = {
+    ok:true, label:CFG.label,
+    pron:Math.round(r.pron), accuracy:Math.round(r.accuracy),
+    fluency:Math.round(r.fluency), completeness:Math.round(r.completeness),
+    seconds:r.seconds, refWordCount:r.refWordCount, spokenWordCount:r.spokenWordCount,
+    weakWords:(r.words||[]).filter(function(w){
+        var p=w.PronunciationAssessment||{};
+        return (p.ErrorType && p.ErrorType!=='None') || (p.AccuracyScore||100) < 60;
+      }).slice(0,8).map(function(w){
+        return { word:w.Word, score:Math.round((w.PronunciationAssessment||{}).AccuracyScore||0),
+                 type:(w.PronunciationAssessment||{}).ErrorType||'' }; })
+  };
+  if (D.opener) { try { window.opener.postMessage({type:'REC_RESULT', payload:payload}, parentOrigin||'*'); } catch(e){} }
+  $('btnSend').textContent = '전송됨 ✓';
+  setTimeout(function(){ window.close(); }, 500);
+});
+
+/* ---------- 입력 레벨 미터(실제로 소리가 들어오는지 눈으로 확인) ---------- */
+var actx = null, src = null, an = null;
+function startLevelMeter(stream){
+  try {
+    actx = new (window.AudioContext || window.webkitAudioContext)();
+    if (actx.state === 'suspended') actx.resume();
+    src = actx.createMediaStreamSource(stream);
+    an = actx.createAnalyser(); an.fftSize = 512;
+    src.connect(an);
+    var buf = new Uint8Array(an.frequencyBinCount);
+    levelTimer = setInterval(function(){
+      an.getByteTimeDomainData(buf);
+      var peak = 0;
+      for (var i=0;i<buf.length;i++){ var v = Math.abs(buf[i]-128)/128; if (v>peak) peak=v; }
+      $('lvBar').style.width = Math.min(100, peak*220) + '%';
+    }, 80);
+  } catch(e){}
+}
+function stopLevelMeter(){
+  if (levelTimer) clearInterval(levelTimer); levelTimer = null;
+  $('lvBar').style.width = '0';
+  try { if (actx) actx.close(); } catch(e){}
+}
+</script>
+</body>
+</html>
