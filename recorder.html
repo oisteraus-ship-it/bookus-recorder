@@ -137,10 +137,31 @@ var ALLOW_ORIGINS = [
 var DEV_RELAX_ORIGIN = true;
 
 var SDK = window.SpeechSDK;
-var CFG = { token:'', region:'', ref:'', label:'' };
+var CFG = { token:'', region:'', ref:'', label:'', engine:'azure' };   // engine: 'azure'(정밀·유료) | 'web'(무료 브라우저 인식)
+function webSpeechOK(){ return !!(window.SpeechRecognition || window.webkitSpeechRecognition); }
+function canStart(){
+  if (!CFG.ref) return false;
+  if (CFG.engine === 'web') return webSpeechOK();
+  return !!(D.sdk && CFG.token);          /* azure */
+}
 var recognizer = null, running = false, startedAt = 0, levelTimer = null;
-var segs = [];               // 구간별 결과 누적
+var segs = [];               // (Azure) 구간별 결과 누적
+var webRec = null, webTokens = [];   // (무료 web) 브라우저 인식기 · 학생이 말한 단어 토큰 누적
 var resumeCount = 0, userStopping = false, MAX_RESUME = 40;   // 침묵으로 세션이 끊길 때 조용히 이어 듣기
+var heardSpeech = false;     // 마이크로 실제 소리가 들어온 적이 있는가(무음 오판 방지)
+var deafTries = 0;           // 무음 감시 재확인 횟수(소리는 들어오는데 채점이 늦을 때 더 기다린다)
+
+/* ★ Azure 비용 안전장치 — 학생이 켜놓고 자리를 비워도 오디오가 무한정 쌓이지 않게 한다.
+   Azure는 녹음된 오디오 시간만큼 과금한다. 평소엔 '방치 자동 제출'이 과금을 멈추고,
+   교실 소음이 계속 인식돼 그게 안 먹는 드문 경우를 위해 '최대 녹음 시간(천장)'을 둔다.
+   ★ 최대 녹음 시간은 지문 길이에 맞춰 자동 계산한다 → 짧은 지문은 짧게, 긴 챕터는 길게.
+     그래서 정상 낭독은 아무리 길어도 중간에 끊기지 않는다. */
+var IDLE_STOP_MS   = 12000;  // 마지막 '인식된 구간' 뒤 12초간 새 구간이 없으면(다 읽고 멈춤) 자동 제출
+var RA_MS_PER_WORD = 1500;   // 아주 느린 아이 기준 한 단어 낭독 시간(약 40단어/분)
+var RA_CAP_FACTOR  = 2.5;    // 예상 낭독 시간의 몇 배까지 허용할지(정상 낭독은 절대 안 끊기게 넉넉히)
+var RA_CAP_MIN     = 120000; // 최대 녹음 시간 하한(2분) — 짧은 지문도 최소 이만큼은 허용
+var RA_CAP_MAX     = 900000; // 최대 녹음 시간 상한(15분) — 아주 긴 챕터도 덮는 절대 천장
+var capMs = RA_CAP_MIN, lastSegAt = 0, capTimer = null;   // 이번 녹음의 최대 허용 시간 · 마지막 구간 시각 · 감시 타이머
 var parentOrigin = null;
 
 var $ = function(id){ return document.getElementById(id); };
@@ -184,12 +205,20 @@ window.addEventListener('message', function(e){
     parentOrigin = e.origin;
     CFG.token = d.token || ''; CFG.region = d.region || 'koreacentral';
     CFG.ref = String(d.referenceText || '').trim(); CFG.label = d.label || '';
+    CFG.engine = (d.engine === 'web') ? 'web' : (d.engine === 'azure' ? 'azure' : (CFG.token ? 'azure' : 'web'));
     D.token = !!CFG.token; drawDiag();
     if (CFG.label) $('subTitle').textContent = CFG.label;
     showRef(CFG.ref);
-    $('btnRec').disabled = !(D.sdk && CFG.token && CFG.ref);
+    $('btnRec').disabled = !canStart();
     $('btnRec').textContent = '🎤 녹음 시작';
-    $('stat').textContent = '버튼을 누르고 지문을 소리 내어 읽어 주세요.';
+    if (CFG.engine === 'web' && !webSpeechOK()) {
+      $('stat').innerHTML = '<span style="color:#b23">이 브라우저는 무료 음성인식을 지원하지 않습니다(크롬·사파리 권장). '
+        + '아래 버튼으로 계속 진행하세요.</span>';
+      $('btnSkip').style.display = '';
+    } else {
+      $('stat').textContent = '버튼을 누르고 지문을 소리 내어 읽어 주세요.'
+        + (CFG.engine === 'web' ? ' (무료 모드: 읽기 일치율로 채점)' : '');
+    }
   } else if (d.type === 'REC_ERROR') {
     $('stat').innerHTML = '<span style="color:#b23">'+ (d.message||'오류') +'</span>';
   }
@@ -211,6 +240,7 @@ function failParent(reason, detail){
      "듣고 있어요…"로 덮어쓰는 경우가 있어서, 여기서 상태를 확정한다. */
   running = false;
   clearTimeout(window.__deaf__);
+  clearInterval(capTimer);
   stopLevelMeter();
   var b = $('btnRec');
   b.classList.remove('rec'); b.disabled = false; b.textContent = '🎤 다시 시도';
@@ -249,23 +279,26 @@ function makeSpeechConfig(){
   }
   sc.speechRecognitionLanguage = 'en-US';
   /* 문장 중간의 짧은 숨·머뭇거림에서 구간이 끊기지 않도록 침묵 허용치를 늘린다(천천히 읽는 아이 배려) */
-  try { sc.setProperty(SDK.PropertyId.Speech_SegmentationSilenceTimeoutMs, '3000'); } catch(e){}
+  try { sc.setProperty(SDK.PropertyId.Speech_SegmentationSilenceTimeoutMs, '1500'); } catch(e){}
   /* 시작 직후 잠깐 머뭇거려도 끊기지 않도록 초기 침묵 허용치도 넉넉히 */
   try { sc.setProperty(SDK.PropertyId.SpeechServiceConnection_InitialSilenceTimeoutMs, '15000'); } catch(e){}
   return sc;
 }
 
 function startRec(){
-  if (!D.sdk || !CFG.token || !CFG.ref) return;
-  segs = []; $('cardRes').style.display='none';
+  if (!canStart()) return;
+  segs = []; webTokens = []; $('cardRes').style.display='none';
   FAILED = false;                       /* 다시 시도하면 판정을 초기화한다 */
+  resumeCount = 0; userStopping = false; heardSpeech = false; deafTries = 0;
   $('stat').textContent = '마이크 권한을 확인하는 중…';
 
-  /* 권한을 먼저 명시적으로 받아 진단에 남긴다(iOS는 사용자 제스처 안에서 호출돼야 함) */
+  /* 권한을 먼저 명시적으로 받아 진단에 남긴다(iOS는 사용자 제스처 안에서 호출돼야 함).
+     무료(web)·정밀(azure) 둘 다 마이크 권한과 레벨미터는 동일하게 쓴다. */
   navigator.mediaDevices.getUserMedia({ audio:true }).then(function(stream){
     D.mic = true; drawDiag();
     startLevelMeter(stream);
-    beginRecognition();
+    if (CFG.engine === 'web') beginWebRecognition();
+    else beginRecognition();
   }).catch(function(err){
     D.mic = false; drawDiag();
     $('stat').innerHTML = '<span style="color:#b23">마이크를 열 수 없습니다: '
@@ -289,12 +322,24 @@ function buildRecognizer(){
   );
   pa.applyTo(rec);
 
+  /* 중간 인식(말하는 도중 실시간으로 계속 들어온다) — 마이크가 살아있다는 확실한 증거.
+     소리가 들어오는 한 "소리 없음" 안전장치가 발동하지 않도록 타이머를 꺼 둔다. */
+  rec.recognizing = function(s, e){
+    if (FAILED) return;
+    heardSpeech = true;
+    clearTimeout(window.__deaf__);
+    if (running && !segs.length) $('stat').textContent = '듣고 있어요… 계속 읽어 주세요.';
+  };
   rec.recognized = function(s, e){
+    if (FAILED) return;
     if (e.result.reason !== SDK.ResultReason.RecognizedSpeech) return;
     try {
       var js = e.result.properties.getProperty(SDK.PropertyId.SpeechServiceResponse_JsonResult);
       var nb = JSON.parse(js).NBest[0];
       segs.push(nb);
+      heardSpeech = true;
+      lastSegAt = Date.now();          /* 마지막 채점 구간 시각 갱신(방치 자동제출 판단용) */
+      clearTimeout(window.__deaf__);
       $('stat').textContent = '읽는 중… ' + segs.length + '구간 (' + elapsed() + '초) — 다 읽으면 ■ 버튼을 눌러요';
     } catch(err){}
   };
@@ -323,23 +368,61 @@ function buildRecognizer(){
   return rec;
 }
 
+/* 무음 감시: 소리(마이크 레벨)가 들어오는 한 절대 학생을 끊지 않는다.
+   · 채점 구간이 하나라도 오면 → 문제 없음(타이머는 recognized에서 이미 꺼짐)
+   · 소리는 들어오는데(heardSpeech) 아직 채점이 안 왔으면 → 끊지 말고 더 기다린다
+   · 소리도 전혀 없으면(heardSpeech=false) → 진짜 마이크 문제이므로 그때만 알린다 */
+function armDeafWatch(){
+  clearTimeout(window.__deaf__);
+  window.__deaf__ = setTimeout(function(){
+    if (!running || segs.length) return;
+    if (heardSpeech && deafTries < 6) {     // 소리는 들어오는 중 → 최대 ~2분까지 더 기다림
+      deafTries++;
+      $('stat').textContent = '듣고 있어요… 편하게 계속 읽어 주세요. (다 읽으면 ■ 버튼)';
+      armDeafWatch();
+      return;
+    }
+    if (heardSpeech) return;                // 소리는 났었는데 채점만 늦는 경우 — 끊지 않는다
+    $('stat').innerHTML = '<span style="color:#b23">소리가 들어오지 않고 있어요. '
+      + '마이크를 확인하거나 아래 버튼으로 계속 진행하세요.</span>';
+    failParent('no_speech', 'no audio 20s');
+  }, 20000);
+}
+
+/* ★ 비용 상한 감시(1초마다) — 최대 녹음 시간 초과 또는 방치(오래 무음) 시 자동 제출한다.
+   자동 이어듣기와 무관하게 '녹음 시작 시각'부터의 실제 경과로 판단하므로 상한이 확실히 걸린다. */
+function startCapWatch(){
+  clearInterval(capTimer);
+  capTimer = setInterval(function(){
+    if (!running) { clearInterval(capTimer); return; }
+    var now = Date.now();
+    if (now - startedAt > capMs) { autoFinish('max'); return; }                   /* 최대 시간(지문 길이 기준) 초과 → 강제 제출 */
+    if ((segs.length || webTokens.length) && (now - lastSegAt > IDLE_STOP_MS)) { autoFinish('idle'); }  /* 읽다가 오래 방치 → 자동 제출 */
+  }, 1000);
+}
+/* 상한에 걸려 자동으로 끝낼 때: 지금까지 읽은 것으로 채점하고 녹음을 확실히 멈춘다(오디오 과금 중단). */
+function autoFinish(why){
+  if (!running || userStopping) return;
+  clearInterval(capTimer);
+  window.__autoNote__ = (why === 'max')
+    ? '⏱️ 최대 녹음 시간에 도달해 자동 제출했어요.'
+    : '⏱️ 한동안 소리가 없어 자동 제출했어요.';
+  stopRec(false);                    /* 지금까지 구간으로 채점(render) — 없으면 no_speech 로 안전 종료 */
+}
+
 function beginRecognition(){
-  resumeCount = 0; userStopping = false;
+  resumeCount = 0; userStopping = false; heardSpeech = false; deafTries = 0;
   recognizer = buildRecognizer();
   recognizer.startContinuousRecognitionAsync(function(){
     if (FAILED) return;              /* 이미 실패로 판정된 뒤 늦게 도착한 콜백은 무시 */
-    running = true; startedAt = Date.now();
+    running = true; startedAt = Date.now(); lastSegAt = Date.now();
+    /* 이번 지문 길이에 맞춰 최대 녹음 시간을 정한다(긴 챕터는 길게 → 정상 낭독은 안 끊김) */
+    var words = String(CFG.ref || '').split(/\s+/).filter(Boolean).length;
+    capMs = Math.min(RA_CAP_MAX, Math.max(RA_CAP_MIN, words * RA_MS_PER_WORD * RA_CAP_FACTOR + 30000));
     $('btnRec').textContent = '■ 다 읽었어요'; $('btnRec').classList.add('rec');
     $('stat').textContent = '듣고 있어요… 지문을 소리 내어 읽어 주세요.';
-    /* 25초가 지나도록 한 구간도 못 받으면 채점이 안 되고 있는 것이다 */
-    clearTimeout(window.__deaf__);
-    window.__deaf__ = setTimeout(function(){
-      if (running && !segs.length) {
-        $('stat').innerHTML = '<span style="color:#b23">소리가 인식되지 않고 있어요. '
-          + '마이크를 확인하거나 아래 버튼으로 계속 진행하세요.</span>';
-        failParent('no_speech', '25s silent');
-      }
-    }, 25000);
+    armDeafWatch();                  /* 마이크로 소리가 전혀 안 들어올 때만 알리는 감시 */
+    startCapWatch();                 /* 비용 안전장치: 최대 시간·방치 자동 제출 */
   }, function(err){
     $('stat').innerHTML = '<span style="color:#b23">시작 실패: '+err+'</span>';
     failParent('start_failed', err);
@@ -360,12 +443,126 @@ function resumeRecognition(){
   });
 }
 
+/* ═══════════════ 무료 엔진: 브라우저 Web Speech(과금 없음) ═══════════════
+   브라우저 내장 음성인식으로 전사만 받아, 지문과 대조해 '읽기 일치율'로 채점한다.
+   발음의 질(정확도·유창성)은 측정하지 못하지만, 낭독 게이트용으로는 충분하고 무료다. */
+function normWord(w){ return String(w||'').toLowerCase().replace(/[^a-z0-9']/g,''); }
+function pushWebTranscript(text){
+  var ws = String(text||'').split(/\s+/);
+  for (var i=0;i<ws.length;i++){ var n = normWord(ws[i]); if (n) webTokens.push(n); }
+}
+function beginWebRecognition(){
+  var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) { failParent('web_unsupported', '브라우저 음성인식 미지원'); return; }
+  resumeCount = 0; userStopping = false; heardSpeech = false; deafTries = 0;
+  try { webRec = new SR(); } catch(e){ failParent('start_failed', String(e)); return; }
+  webRec.lang = 'en-US'; webRec.continuous = true; webRec.interimResults = true; webRec.maxAlternatives = 1;
+
+  webRec.onresult = function(ev){
+    for (var i = ev.resultIndex; i < ev.results.length; i++){
+      var r = ev.results[i];
+      heardSpeech = true; clearTimeout(window.__deaf__);
+      if (r.isFinal) {
+        pushWebTranscript(r[0] && r[0].transcript);
+        lastSegAt = Date.now();
+        $('stat').textContent = '읽는 중… ' + webTokens.length + '단어 (' + elapsed() + '초) — 다 읽으면 ■ 버튼을 눌러요';
+      } else if (running && !webTokens.length) {
+        $('stat').textContent = '듣고 있어요… 계속 읽어 주세요.';
+      }
+    }
+  };
+  webRec.onerror = function(ev){
+    var err = (ev && ev.error) || '';
+    if (err === 'not-allowed' || err === 'service-not-allowed') { failParent('mic_denied', err); return; }
+    if (err === 'language-not-supported' || err === 'bad-grammar') { failParent('web_unsupported', err); return; }
+    /* no-speech / aborted / network 등은 onend에서 자동 재시작으로 처리 */
+  };
+  webRec.onend = function(){
+    /* Web Speech는 침묵이 조금만 길어도 스스로 멈춘다. 학생이 아직 "다 읽었어요"를
+       안 눌렀으면 조용히 다시 시작해 끊김 없이 이어 읽게 한다. */
+    if (running && !userStopping && !FAILED && resumeCount < MAX_RESUME) {
+      resumeCount++;
+      try { webRec.start(); }
+      catch(e){ setTimeout(function(){ try { webRec.start(); } catch(_){ if(webTokens.length){ stopRec(true); render(); } } }, 250); }
+      return;
+    }
+    if (userStopping) return;                 /* stopRec가 채점(render)을 처리 */
+    if (webTokens.length) { stopRec(true); render(); }   /* 재시도 한계 등으로 끝나도 읽은 건 채점 */
+  };
+
+  try { webRec.start(); }
+  catch(e){ failParent('start_failed', String(e)); return; }
+
+  running = true; startedAt = Date.now(); lastSegAt = Date.now();
+  var words = String(CFG.ref || '').split(/\s+/).filter(Boolean).length;
+  capMs = Math.min(RA_CAP_MAX, Math.max(RA_CAP_MIN, words * RA_MS_PER_WORD * RA_CAP_FACTOR + 30000));
+  $('btnRec').textContent = '■ 다 읽었어요'; $('btnRec').classList.add('rec');
+  $('stat').textContent = '듣고 있어요… 지문을 소리 내어 읽어 주세요. (무료 모드)';
+  armDeafWatch();
+  startCapWatch();
+}
+
+/* 무료 엔진 채점: 지문 단어를 순서대로 훑으며, 학생이 말한 토큰에서 순차적으로 찾는다(그리디 정렬).
+   찾은 비율 = 읽기 일치율(완독률). 못 찾은 단어는 '빠진 단어'로 표시·전송. */
+function aggregateWeb(){
+  var refRaw = String(CFG.ref||'').split(/\s+/).filter(Boolean);
+  var ref = refRaw.map(function(w){ return { orig:w, norm:normWord(w) }; }).filter(function(x){ return x.norm; });
+  var sp = webTokens.slice();
+  var j = 0, matched = 0, WIN = 8;   // 말한 토큰을 앞으로만 훑되, 조금 건너뛴 것도 허용
+  var wordsOut = [];
+  for (var i=0;i<ref.length;i++){
+    var hit = -1;
+    for (var k=j; k<Math.min(sp.length, j+WIN); k++){ if (sp[k] === ref[i].norm){ hit = k; break; } }
+    if (hit >= 0){ matched++; j = hit + 1; wordsOut.push({ Word:ref[i].orig, ok:true }); }
+    else { wordsOut.push({ Word:ref[i].orig, ok:false }); }
+  }
+  var completeness = ref.length ? Math.round(matched/ref.length*100) : 0;
+  return { completeness:completeness, matched:matched, refWordCount:ref.length,
+           spokenWordCount:sp.length, words:wordsOut, seconds:elapsed() };
+}
+function renderWeb(){
+  if (!webTokens.length) {
+    $('stat').innerHTML = '<span style="color:#b23">인식된 말이 없습니다. 마이크 입력을 확인하고 다시 시도해 주세요.</span>';
+    failParent('no_speech', 'empty web result');
+    return;
+  }
+  var r = aggregateWeb();
+  var pct = r.completeness;
+  /* 무료 모드는 발음의 질을 못 재므로 네 칸을 모두 '읽기 일치율'로 채운다(게이트 판정용). */
+  $('sPron').textContent = pct;  $('sAcc').textContent = pct;
+  $('sFlu').textContent = pct;   $('sCom').textContent = pct;
+  $('words').innerHTML = r.words.map(function(w){
+    return '<span class="'+(w.ok?'w-ok':'w-om')+'">'+ (w.Word||'') +'</span>';
+  }).join(' ');
+  $('raw').textContent = JSON.stringify({ engine:'web', 읽기일치율:pct,
+    맞은단어:r.matched, 지문단어:r.refWordCount, 말한단어:r.spokenWordCount, seconds:r.seconds }, null, 1);
+  $('cardRes').style.display = 'block';
+  $('stat').textContent = (window.__autoNote__ ? (window.__autoNote__+' ') : '')
+    + '완료(무료) — 읽기 일치율 ' + pct + '% · ' + r.seconds + '초';
+  window.__autoNote__ = '';
+  window.__LASTWEB__ = r;
+}
+
 function elapsed(){ return Math.round((Date.now()-startedAt)/1000); }
 
 function stopRec(silent){
   userStopping = true;                 // 이 시점 이후의 취소 이벤트로는 이어듣기를 하지 않는다
-  if (!recognizer) return;
-  running = false; clearTimeout(window.__deaf__);
+  clearInterval(capTimer);             // 상한 감시 종료(오디오 과금 중단)
+  clearTimeout(window.__deaf__);
+  if (CFG.engine === 'web') {          /* 무료 엔진 종료 */
+    if (webRec == null && !running) return;
+    running = false;
+    $('btnRec').textContent = '채점 중…'; $('btnRec').classList.remove('rec'); $('btnRec').disabled = true;
+    stopLevelMeter();
+    try { if (webRec) webRec.stop(); } catch(e){}
+    try { if (webRec) webRec.onend = null; } catch(e){}  /* 종료 후 자동 재시작 방지 */
+    webRec = null;
+    if (!silent) render();
+    $('btnRec').disabled = false; $('btnRec').textContent = '🎤 다시 녹음';
+    return;
+  }
+  if (!recognizer) return;             /* 정밀(azure) 엔진 종료 */
+  running = false;
   $('btnRec').textContent = '채점 중…'; $('btnRec').classList.remove('rec'); $('btnRec').disabled = true;
   stopLevelMeter();
   recognizer.stopContinuousRecognitionAsync(function(){
@@ -402,6 +599,7 @@ function aggregate(){
 }
 
 function render(){
+  if (CFG.engine === 'web') { renderWeb(); return; }   /* 무료 엔진은 별도 채점 */
   if (!segs.length) {
     $('stat').innerHTML = '<span style="color:#b23">인식된 말이 없습니다. 마이크 입력을 확인하고 다시 시도해 주세요.</span>';
     failParent('no_speech', 'empty result');   /* 다시 시도해도 되고, 그냥 진행해도 된다 */
@@ -425,24 +623,39 @@ function render(){
     segments:segs.length }, null, 1);
 
   $('cardRes').style.display = 'block';
-  $('stat').textContent = '완료 — ' + r.seconds + '초 · ' + segs.length + '구간';
+  $('stat').textContent = (window.__autoNote__ ? (window.__autoNote__ + ' ') : '')
+    + '완료 — ' + r.seconds + '초 · ' + segs.length + '구간';
+  window.__autoNote__ = '';
   window.__LAST__ = r;
 }
 
 $('btnSend').addEventListener('click', function(){
-  var r = window.__LAST__; if (!r) return;
-  var payload = {
-    ok:true, label:CFG.label,
-    pron:Math.round(r.pron), accuracy:Math.round(r.accuracy),
-    fluency:Math.round(r.fluency), completeness:Math.round(r.completeness),
-    seconds:r.seconds, refWordCount:r.refWordCount, spokenWordCount:r.spokenWordCount,
-    weakWords:(r.words||[]).filter(function(w){
-        var p=w.PronunciationAssessment||{};
-        return (p.ErrorType && p.ErrorType!=='None') || (p.AccuracyScore||100) < 60;
-      }).slice(0,8).map(function(w){
-        return { word:w.Word, score:Math.round((w.PronunciationAssessment||{}).AccuracyScore||0),
-                 type:(w.PronunciationAssessment||{}).ErrorType||'' }; })
-  };
+  var payload;
+  if (CFG.engine === 'web') {
+    var w = window.__LASTWEB__; if (!w) return;
+    /* 무료 모드: 발음 질은 못 재므로 네 점수 모두 '읽기 일치율'. 못 읽은 단어를 빠진 단어로. */
+    payload = {
+      ok:true, engine:'web', label:CFG.label,
+      pron:w.completeness, accuracy:w.completeness, fluency:w.completeness, completeness:w.completeness,
+      seconds:w.seconds, refWordCount:w.refWordCount, spokenWordCount:w.spokenWordCount,
+      weakWords:(w.words||[]).filter(function(x){ return !x.ok; }).slice(0,8)
+                  .map(function(x){ return { word:x.Word, score:0, type:'Omission' }; })
+    };
+  } else {
+    var r = window.__LAST__; if (!r) return;
+    payload = {
+      ok:true, engine:'azure', label:CFG.label,
+      pron:Math.round(r.pron), accuracy:Math.round(r.accuracy),
+      fluency:Math.round(r.fluency), completeness:Math.round(r.completeness),
+      seconds:r.seconds, refWordCount:r.refWordCount, spokenWordCount:r.spokenWordCount,
+      weakWords:(r.words||[]).filter(function(w){
+          var p=w.PronunciationAssessment||{};
+          return (p.ErrorType && p.ErrorType!=='None') || (p.AccuracyScore||100) < 60;
+        }).slice(0,8).map(function(w){
+          return { word:w.Word, score:Math.round((w.PronunciationAssessment||{}).AccuracyScore||0),
+                   type:(w.PronunciationAssessment||{}).ErrorType||'' }; })
+    };
+  }
   if (D.opener) { try { window.opener.postMessage({type:'REC_RESULT', payload:payload}, parentOrigin||'*'); } catch(e){} }
   $('btnSend').textContent = '전송됨 ✓';
   setTimeout(function(){ window.close(); }, 500);
@@ -462,6 +675,7 @@ function startLevelMeter(stream){
       an.getByteTimeDomainData(buf);
       var peak = 0;
       for (var i=0;i<buf.length;i++){ var v = Math.abs(buf[i]-128)/128; if (v>peak) peak=v; }
+      if (peak > 0.04) heardSpeech = true;   /* 실제 소리가 들어옴 → 무음 오판 방지(Azure 이벤트보다 확실) */
       $('lvBar').style.width = Math.min(100, peak*220) + '%';
     }, 80);
   } catch(e){}
