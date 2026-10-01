@@ -459,6 +459,7 @@ function beginWebRecognition(){
   webRec.lang = 'en-US'; webRec.continuous = true; webRec.interimResults = true; webRec.maxAlternatives = 1;
 
   webRec.onresult = function(ev){
+    if (!running || userStopping) return;     /* 멈춘 뒤 늦게 도착한 결과는 무시(상태표시 덮어쓰기·멈춤 방지) */
     for (var i = ev.resultIndex; i < ev.results.length; i++){
       var r = ev.results[i];
       heardSpeech = true; clearTimeout(window.__deaf__);
@@ -508,17 +509,25 @@ function aggregateWeb(){
   var refRaw = String(CFG.ref||'').split(/\s+/).filter(Boolean);
   var ref = refRaw.map(function(w){ return { orig:w, norm:normWord(w) }; }).filter(function(x){ return x.norm; });
   var sp = webTokens.slice();
-  var j = 0, matched = 0, WIN = 8;   // 말한 토큰을 앞으로만 훑되, 조금 건너뛴 것도 허용
+  /* 브라우저 무료 인식은 (1) 외국어 아동 발음을 자주 틀리게 받아쓰고, (2) 쉬는 사이 스스로 멈췄다
+     다시 켜지며 몇 단어를 흘린다. 그래서 '좁은 창 + 앞으로만' 정렬은 실제로 읽은 단어를 자꾸
+     놓친다. 여기서는 남은 전사 '전체'를 훑어 순서만 지키면 맞춘 것으로 보고(관대 정렬),
+     학생이 실제로 '어디까지' 읽었는지(lastRefHit)를 따로 잡아 그 뒤만 '아직 안 읽음'으로 본다. */
+  var j = 0, matched = 0, lastRefHit = -1;
   var wordsOut = [];
   for (var i=0;i<ref.length;i++){
     var hit = -1;
-    for (var k=j; k<Math.min(sp.length, j+WIN); k++){ if (sp[k] === ref[i].norm){ hit = k; break; } }
-    if (hit >= 0){ matched++; j = hit + 1; wordsOut.push({ Word:ref[i].orig, ok:true }); }
-    else { wordsOut.push({ Word:ref[i].orig, ok:false }); }
+    for (var k=j; k<sp.length; k++){ if (sp[k] === ref[i].norm){ hit = k; break; } }   // 남은 토큰 '전체'에서 탐색
+    if (hit >= 0){ matched++; j = hit + 1; lastRefHit = i; wordsOut.push({ Word:ref[i].orig, ok:true }); }
+    else { wordsOut.push({ Word:ref[i].orig, ok:false, reached:(i <= lastRefHit) }); }
   }
+  /* reached=true 인 미매칭은 '읽긴 했는데 받아쓰기가 틀린' 쪽(무료의 한계) → 벌점·빗금 대상 아님.
+     reached=false(마지막 매칭 뒤) 미매칭만 '아직 안 읽은 뒤부분'으로 본다. */
+  wordsOut.forEach(function(w,i){ if(!w.ok && (lastRefHit<0 || i>lastRefHit)) w.unread = true; });
   var completeness = ref.length ? Math.round(matched/ref.length*100) : 0;
-  return { completeness:completeness, matched:matched, refWordCount:ref.length,
-           spokenWordCount:sp.length, words:wordsOut, seconds:elapsed() };
+  var reachedPct   = ref.length ? Math.round((lastRefHit+1)/ref.length*100) : 0;  // 끝까지 읽었는지(진행률)
+  return { completeness:completeness, reachedPct:reachedPct, matched:matched, lastRefHit:lastRefHit,
+           refWordCount:ref.length, spokenWordCount:sp.length, words:wordsOut, seconds:elapsed() };
 }
 function renderWeb(){
   if (!webTokens.length) {
@@ -527,18 +536,24 @@ function renderWeb(){
     return;
   }
   var r = aggregateWeb();
-  var pct = r.completeness;
-  /* 무료 모드는 발음의 질을 못 재므로 네 칸을 모두 '읽기 일치율'로 채운다(게이트 판정용). */
-  $('sPron').textContent = pct;  $('sAcc').textContent = pct;
-  $('sFlu').textContent = pct;   $('sCom').textContent = pct;
+  /* 무료 모드는 '발음의 질'을 못 잰다. 게이트/기록에 쓰는 점수는 끝까지 읽었는지(진행률)로 본다
+     — 받아쓰기 오류로 중간 단어가 안 맞아도 읽은 건 읽은 것으로 인정. */
+  var score = Math.max(r.completeness, r.reachedPct);
+  $('sPron').textContent = score;  $('sAcc').textContent = score;
+  $('sFlu').textContent = score;   $('sCom').textContent = score;
+  /* 표시: 맞은 단어는 초록. '읽었지만 받아쓰기가 틀린' 중간 단어는 평범하게(빗금 X).
+     마지막으로 읽은 지점 뒤(아직 안 읽은 부분)만 연하게 표시한다. */
   $('words').innerHTML = r.words.map(function(w){
-    return '<span class="'+(w.ok?'w-ok':'w-om')+'">'+ (w.Word||'') +'</span>';
+    var cls = w.ok ? 'w-ok' : (w.unread ? 'w-om' : '');
+    return cls ? ('<span class="'+cls+'">'+(w.Word||'')+'</span>') : (w.Word||'');
   }).join(' ');
-  $('raw').textContent = JSON.stringify({ engine:'web', 읽기일치율:pct,
-    맞은단어:r.matched, 지문단어:r.refWordCount, 말한단어:r.spokenWordCount, seconds:r.seconds }, null, 1);
+  $('raw').textContent = JSON.stringify({ engine:'web', 점수:score, 읽기일치율:r.completeness,
+    진행률:r.reachedPct, 맞은단어:r.matched, 지문단어:r.refWordCount, 말한단어:r.spokenWordCount, seconds:r.seconds }, null, 1);
   $('cardRes').style.display = 'block';
+  var tail = (r.lastRefHit >= 0 && r.lastRefHit < r.refWordCount-1)
+    ? (' · 뒤쪽 ' + (r.refWordCount-1-r.lastRefHit) + '단어는 더 읽어도 좋아요') : '';
   $('stat').textContent = (window.__autoNote__ ? (window.__autoNote__+' ') : '')
-    + '완료(무료) — 읽기 일치율 ' + pct + '% · ' + r.seconds + '초';
+    + '완료(무료) — 읽기 ' + score + '%' + tail + ' · ' + r.seconds + '초';
   window.__autoNote__ = '';
   window.__LASTWEB__ = r;
 }
@@ -554,8 +569,11 @@ function stopRec(silent){
     running = false;
     $('btnRec').textContent = '채점 중…'; $('btnRec').classList.remove('rec'); $('btnRec').disabled = true;
     stopLevelMeter();
-    try { if (webRec) webRec.stop(); } catch(e){}
-    try { if (webRec) webRec.onend = null; } catch(e){}  /* 종료 후 자동 재시작 방지 */
+    /* 멈추기 전에 모든 핸들러를 떼어낸다 — 종료 후 늦게 오는 결과/종료 이벤트가
+       자동 재시작을 걸거나 "읽는 중…"으로 화면을 되돌려 멈춘 것처럼 보이게 하는 것을 막는다. */
+    if (webRec) { try { webRec.onresult = null; webRec.onerror = null; webRec.onend = null; webRec.onspeechend = null; } catch(e){} }
+    try { if (webRec) webRec.stop();  } catch(e){}
+    try { if (webRec) webRec.abort(); } catch(e){}   /* 확실히 종료(과금 없음·마이크 해제) */
     webRec = null;
     if (!silent) render();
     $('btnRec').disabled = false; $('btnRec').textContent = '🎤 다시 녹음';
@@ -633,12 +651,14 @@ $('btnSend').addEventListener('click', function(){
   var payload;
   if (CFG.engine === 'web') {
     var w = window.__LASTWEB__; if (!w) return;
-    /* 무료 모드: 발음 질은 못 재므로 네 점수 모두 '읽기 일치율'. 못 읽은 단어를 빠진 단어로. */
+    /* 무료 모드: 발음 질은 못 재므로 네 점수 모두 '읽기 점수'(진행률·관대 일치율 중 큰 값).
+       '빠진 단어'는 받아쓰기 오류와 구분이 안 되므로, 실제로 '아직 안 읽은 뒤부분'만 기록한다. */
+    var sc = Math.max(w.completeness||0, w.reachedPct||0);
     payload = {
       ok:true, engine:'web', label:CFG.label,
-      pron:w.completeness, accuracy:w.completeness, fluency:w.completeness, completeness:w.completeness,
+      pron:sc, accuracy:sc, fluency:sc, completeness:sc,
       seconds:w.seconds, refWordCount:w.refWordCount, spokenWordCount:w.spokenWordCount,
-      weakWords:(w.words||[]).filter(function(x){ return !x.ok; }).slice(0,8)
+      weakWords:(w.words||[]).filter(function(x){ return x.unread; }).slice(0,8)
                   .map(function(x){ return { word:x.Word, score:0, type:'Omission' }; })
     };
   } else {
