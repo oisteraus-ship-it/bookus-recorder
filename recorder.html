@@ -177,7 +177,7 @@ function canStart(){
 }
 var recognizer = null, running = false, startedAt = 0, levelTimer = null;
 var segs = [];               // (Azure) 구간별 결과 누적
-var webRec = null, webTokens = [], webInterim = '';   // (무료 web) 브라우저 인식기 · 확정 단어 누적 · 아직 확정 안 된 중간 전사
+var webRec = null, webTokens = [], webSession = [];   // (무료 web) 인식기 · 확정(세션 간) 누적 · 현재 세션의 전체 전사
 var webNoProg = 0;   // 소리/단어가 전혀 안 들어온 채로 세션이 끊긴 횟수(모바일 인앱 브라우저 감지용)
 /* 카카오톡·네이버 앱 등 '인앱 브라우저(웹뷰)'에서는 브라우저 음성인식이 아예 안 되거나
    권한 창이 반복해서 뜬다. 이런 환경을 미리 감지해 '크롬/사파리로 열기'를 안내한다. */
@@ -360,11 +360,12 @@ function alignWeb(sp){
 var FOLLOW_ON = true, followPos = -1, lastFollowLen = -1;
 function updateFollow(){
   if (!FOLLOW_ON || !REF_WORDS.length) return;
-  if (webTokens.length === lastFollowLen) return;   // 새 확정 단어가 없으면 재계산 안 함(가벼움)
-  lastFollowLen = webTokens.length;
+  var sp = allSpoken();
+  if (sp.length === lastFollowLen) return;   // 말한 단어가 늘지 않았으면 재계산 안 함(가벼움)
+  lastFollowLen = sp.length;
   var spans = $('ref').getElementsByClassName('rw');
   if (!spans.length) return;
-  var a = alignWeb(webTokens);           // 중간(interim) 전사는 하이라이트에 쓰지 않는다 → 떨림 방지
+  var a = alignWeb(sp);
   if (a.lastRefHit <= followPos) return; // 앞으로 나아갈 때만 갱신(뒤로·제자리면 아무것도 안 함)
   followPos = a.lastRefHit;
   for (var m = 0; m < spans.length; m++){
@@ -388,7 +389,7 @@ function clearFollow(){
 /* 진단: 브라우저가 실제로 '들은 말'을 화면에 보여 준다(무료 모드). 점수가 낮을 때 원인 파악용. */
 function showHeard(){
   if (CFG.engine !== 'web' || !$('heard')) return;
-  var t = webTokens.join(' ') + (webInterim ? (' ' + webInterim) : '');
+  var t = allSpoken().join(' ');
   $('heard').innerHTML = t ? ('<b>들린 말:</b> ' + escapeHtml(t)) : '';
 }
 
@@ -495,7 +496,7 @@ function azLeftNote(){
 function startRec(){
   if (!canStart()) return;
   if (!azTryGate()) return;             /* (Azure) 녹음 횟수 상한 확인 */
-  segs = []; webTokens = []; webInterim = ''; $('cardRes').style.display='none';
+  segs = []; webTokens = []; webSession = []; $('cardRes').style.display='none';
   clearFollow();                        /* 처음부터 다시 → 따라읽기 강조 초기화 */
   $('btnMore').style.display = 'none';   /* 처음부터 다시 → 이어읽기 버튼 숨김 */
   FAILED = false;                       /* 다시 시도하면 판정을 초기화한다 */
@@ -670,10 +671,35 @@ function resumeRecognition(){
    브라우저 내장 음성인식으로 전사만 받아, 지문과 대조해 '읽기 일치율'로 채점한다.
    발음의 질(정확도·유창성)은 측정하지 못하지만, 낭독 게이트용으로는 충분하고 무료다. */
 function normWord(w){ return String(w||'').toLowerCase().replace(/[^a-z0-9']/g,''); }
-function pushWebTranscript(text){
-  var ws = String(text||'').split(/\s+/);
-  for (var i=0;i<ws.length;i++){ var n = normWord(ws[i]); if (n) webTokens.push(n); }
+function tokenizeWords(text){
+  var ws = String(text||'').split(/\s+/), out = [];
+  for (var i=0;i<ws.length;i++){ var n = normWord(ws[i]); if (n) out.push(n); }
+  return out;
 }
+/* a 의 '끝부분'과 b 의 '앞부분'이 겹치면 그만큼 빼고 이어 붙인다(중복 제거).
+   모바일 크롬은 자라나는 전사를 반복해 보내므로(monica→monica was→…) 이 겹침 제거가 핵심. */
+function mergeOverlap(a, b){
+  if (!a.length) return b.slice();
+  if (!b.length) return a.slice();
+  var max = Math.min(a.length, b.length), k = 0;
+  for (var n = max; n >= 1; n--){
+    var ok = true;
+    for (var i = 0; i < n; i++){ if (a[a.length - n + i] !== b[i]) { ok = false; break; } }
+    if (ok){ k = n; break; }
+  }
+  return a.concat(b.slice(k));
+}
+/* 지금까지 '말한 단어' = (무료) 확정 누적 + 현재 세션 전사(겹침 제거) / (Azure) 구간별 단어. 공용. */
+function allSpoken(){
+  if (CFG.engine !== 'web'){
+    var out = [];
+    segs.forEach(function(nb){ (nb.Words || []).forEach(function(w){ var n = normWord(w.Word); if (n) out.push(n); }); });
+    return out;
+  }
+  return mergeOverlap(webTokens, webSession);
+}
+/* 현재 세션 전사를 확정 누적으로 '동결'(겹침 제거). 세션이 바뀌거나 멈출 때 호출. */
+function freezeSession(){ if (webSession.length){ webTokens = mergeOverlap(webTokens, webSession); webSession = []; } }
 function beginWebRecognition(){
   var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SR) { failParent('web_unsupported', '브라우저 음성인식 미지원'); return; }
@@ -684,30 +710,19 @@ function beginWebRecognition(){
   webRec.onresult = function(ev){
     if (!running || userStopping) return;     /* 멈춘 뒤 늦게 도착한 결과는 무시(상태표시 덮어쓰기·멈춤 방지) */
     D.mic = true; webNoProg = 0;              /* 결과가 오면 마이크·인식 정상(진행 중) */
-    var interim = '';
-    for (var i = ev.resultIndex; i < ev.results.length; i++){
-      var r = ev.results[i];
-      heardSpeech = true; clearTimeout(window.__deaf__);
-      if (r.isFinal) {
-        pushWebTranscript(r[0] && r[0].transcript);   /* 확정된 말 → 누적 */
-        lastSegAt = Date.now();
-      } else {
-        interim += ' ' + ((r[0] && r[0].transcript) || '');   /* 아직 확정 안 된 말(세션이 끊기면 유실되므로 따로 보관) */
-      }
-    }
-    webInterim = interim.trim();
-    if (webTokens.length || webInterim) lastSegAt = Date.now();
-    updateFollow();               /* ✨ 확정 단어로 '앞으로만' 따라가며 강조·자동 스크롤(떨림 없음) */
+    heardSpeech = true; clearTimeout(window.__deaf__);
+    /* 이 세션의 '전체 전사'(확정+중간)를 처음부터 다시 구성해 교체한다.
+       → 자라나는 중간 전사를 append 하지 않으므로(replace) 중복이 쌓이지 않는다(모바일 폭증 방지). */
+    var txt = '';
+    for (var i = 0; i < ev.results.length; i++){ txt += ' ' + ((ev.results[i][0] && ev.results[i][0].transcript) || ''); }
+    webSession = tokenizeWords(txt);
+    lastSegAt = Date.now();
+    updateFollow();               /* ✨ '앞으로만' 따라가며 강조·자동 스크롤(떨림 없음) */
     showHeard();
-    if (webTokens.length) $('stat').textContent = '읽는 중… ' + webTokens.length + '단어 (' + elapsed() + '초) — 다 읽으면 ■ 버튼을 눌러요';
+    var n = allSpoken().length;
+    if (n) $('stat').textContent = '읽는 중… ' + n + '단어 (' + elapsed() + '초) — 다 읽으면 ■ 버튼을 눌러요';
     else if (running) $('stat').textContent = '듣고 있어요… 계속 읽어 주세요.';
   };
-  /* 세션이 끝나기 직전 아직 확정 안 된 중간 전사를 '확정'으로 저장한다.
-     크롬 연속 인식은 쉬는 지점마다 세션을 끝내는데, 그때 이 중간 말을 버리면
-     실제로 읽은 단어가 통째로 사라진다(= 다 읽어도 점수 20~30%·하이라이트 되돌아감의 원인). */
-  function commitWebInterim(){
-    if (webInterim){ pushWebTranscript(webInterim); webInterim = ''; lastSegAt = Date.now(); updateFollow(); showHeard(); }
-  }
   webRec.onerror = function(ev){
     var err = (ev && ev.error) || '';
     if (err === 'not-allowed' || err === 'service-not-allowed') { failParent('mic_denied', err); return; }
@@ -717,10 +732,10 @@ function beginWebRecognition(){
   webRec.onend = function(){
     /* Web Speech는 침묵이 조금만 길어도 스스로 멈춘다. 학생이 아직 "다 읽었어요"를
        안 눌렀으면 조용히 다시 시작해 끊김 없이 이어 읽게 한다. */
-    commitWebInterim();                       /* ★ 끊기기 직전 중간 전사를 확정 저장(유실 방지) */
+    freezeSession();                          /* ★ 현재 세션 전사를 '겹침 제거'하며 확정 저장(유실·중복 둘 다 방지) */
     /* 소리/단어가 전혀 안 들어온 채로 세션이 자꾸 끊기면 = 인식이 동작하지 않는 환경
        (카카오톡·네이버 인앱 브라우저 등). 계속 재시도하면 권한 창만 반복해서 뜨므로 빨리 안내하고 멈춘다. */
-    if (running && !userStopping && !FAILED && !webTokens.length && !heardSpeech) {
+    if (running && !userStopping && !FAILED && !allSpoken().length && !heardSpeech) {
       webNoProg++;
       if (webNoProg >= 3) {
         $('lv').classList.remove('listening');
@@ -737,11 +752,11 @@ function beginWebRecognition(){
     if (running && !userStopping && !FAILED && resumeCount < MAX_RESUME) {
       resumeCount++;
       try { webRec.start(); }
-      catch(e){ setTimeout(function(){ try { webRec.start(); } catch(_){ if(webTokens.length){ stopRec(true); render(); } } }, 250); }
+      catch(e){ setTimeout(function(){ try { webRec.start(); } catch(_){ if(allSpoken().length){ stopRec(true); render(); } } }, 250); }
       return;
     }
     if (userStopping) return;                 /* stopRec가 채점(render)을 처리 */
-    if (webTokens.length) { stopRec(true); render(); }   /* 재시도 한계 등으로 끝나도 읽은 건 채점 */
+    if (allSpoken().length) { stopRec(true); render(); }   /* 재시도 한계 등으로 끝나도 읽은 건 채점 */
   };
 
   try { webRec.start(); }
@@ -762,7 +777,8 @@ function aggregateWeb(){
   var refRaw = String(CFG.ref||'').split(/\s+/).filter(Boolean);
   var ref = refRaw.map(function(w){ return { orig:w, norm:normWord(w) }; }).filter(function(x){ return x.norm; });
   /* 공용 관대 정렬기(alignWeb)로 채점 — 철자 1자 차이·앞부분 일치도 맞은 것으로 본다. */
-  var a = alignWeb(webTokens);
+  var sp = allSpoken();
+  var a = alignWeb(sp);
   var lastRefHit = a.lastRefHit, matched = a.matched;
   var wordsOut = [];
   for (var i=0;i<ref.length;i++){
@@ -773,10 +789,10 @@ function aggregateWeb(){
   var completeness = ref.length ? Math.round(matched/ref.length*100) : 0;
   var reachedPct   = ref.length ? Math.round((lastRefHit+1)/ref.length*100) : 0;  // 끝까지 읽었는지(진행률)
   return { completeness:completeness, reachedPct:reachedPct, matched:matched, lastRefHit:lastRefHit,
-           refWordCount:ref.length, spokenWordCount:webTokens.length, words:wordsOut, seconds:elapsed() };
+           refWordCount:ref.length, spokenWordCount:sp.length, words:wordsOut, seconds:elapsed() };
 }
 function renderWeb(){
-  if (!webTokens.length) {
+  if (!allSpoken().length) {
     $('stat').innerHTML = '<span style="color:#b23">인식된 말이 없습니다. 마이크 입력을 확인하고 다시 시도해 주세요.</span>';
     failParent('no_speech', 'empty web result');
     return;
@@ -817,7 +833,7 @@ function renderWeb(){
   }
   window.__autoNote__ = '';
   window.__LASTWEB__ = r;
-  if (webTokens.length && !FAILED) $('btnMore').style.display = '';   /* 멈춘 곳부터 이어 읽기 제공(아직 기준 미달이어도 더 읽어 채울 수 있게) */
+  if (allSpoken().length && !FAILED) $('btnMore').style.display = '';   /* 멈춘 곳부터 이어 읽기 제공(아직 기준 미달이어도 더 읽어 채울 수 있게) */
 }
 
 function elapsed(){ return Math.round((Date.now()-startedAt)/1000); }
@@ -851,7 +867,7 @@ function stopRec(silent){
     if (webRec == null && !running) return;
     running = false;
     /* 멈추는 순간 아직 확정 안 된 마지막 말(interim)을 잃지 않도록 먼저 저장 */
-    if (webInterim){ pushWebTranscript(webInterim); webInterim = ''; }
+    freezeSession();   /* 멈추는 순간 현재 세션 전사를 겹침 제거하며 확정 저장(마지막 말 유실·중복 방지) */
     $('btnRec').textContent = '채점 중…'; $('btnRec').classList.remove('rec'); $('btnRec').disabled = true;
     stopLevelMeter(); $('lv').classList.remove('listening');
     /* 멈추기 전에 모든 핸들러를 떼어낸다 — 종료 후 늦게 오는 결과/종료 이벤트가
