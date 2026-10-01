@@ -356,18 +356,28 @@ function alignWeb(sp){
   return { matched:L[R][S], lastRefHit:last, ok:ok };
 }
 
-/* ✨ 따라읽기 — 확정된 말(webTokens)만으로 '앞으로만' 이동(되돌아가지 않음), 전진할 때만 부드럽게 스크롤. */
-var FOLLOW_ON = true, followPos = -1, lastFollowLen = -1;
+/* ✨ 따라읽기 — '앞으로만·조금씩' 이동(지역 창 매칭).
+   채점용 전역 정렬(LCS)을 하이라이트에 쓰면, the·to·a·Max 처럼 지문에 여러 번 나오는 단어 때문에
+   매칭이 글 '후반부'로 튀어 하이라이트가 멀리 날아간다(사용자 보고 현상). 그래서 하이라이트는
+   '현재 위치 바로 다음 몇 단어' 안에서만 전진시킨다 → 읽는 사람을 지역적으로 따라감(멀리 안 튐). */
+var FOLLOW_ON = true, followPos = -1, followSp = 0, FOLLOW_WIN = 12;
 function updateFollow(){
   if (!FOLLOW_ON || !REF_WORDS.length) return;
-  var sp = allSpoken();
-  if (sp.length === lastFollowLen) return;   // 말한 단어가 늘지 않았으면 재계산 안 함(가벼움)
-  lastFollowLen = sp.length;
   var spans = $('ref').getElementsByClassName('rw');
   if (!spans.length) return;
-  var a = alignWeb(sp);
-  if (a.lastRefHit <= followPos) return; // 앞으로 나아갈 때만 갱신(뒤로·제자리면 아무것도 안 함)
-  followPos = a.lastRefHit;
+  var sp = allSpoken();
+  if (sp.length < followSp) followSp = 0;        // 다시 시작 등으로 줄면 초기화(방어)
+  if (sp.length <= followSp) return;             // 새 단어 없으면 그대로
+  var moved = false;
+  for (var i = followSp; i < sp.length; i++){
+    var tok = sp[i];
+    var hi = Math.min(REF_WORDS.length - 1, followPos + FOLLOW_WIN);   // 현재 위치 다음 ~12단어까지만 본다
+    for (var r = followPos + 1; r <= hi; r++){
+      if (wordMatch(tok, REF_WORDS[r].norm)){ followPos = r; moved = true; break; }
+    }
+  }
+  followSp = sp.length;
+  if (!moved) return;
   for (var m = 0; m < spans.length; m++){
     spans[m].classList.toggle('read', m <= followPos);
     spans[m].classList.toggle('here', m === followPos + 1);
@@ -380,7 +390,7 @@ function updateFollow(){
   }
 }
 function clearFollow(){
-  followPos = -1; lastFollowLen = -1;
+  followPos = -1; followSp = 0;
   var spans = $('ref').getElementsByClassName('rw');
   for (var m = 0; m < spans.length; m++){ spans[m].classList.remove('read','here'); }
   try { $('ref').scrollTop = 0; } catch(e){}
@@ -711,11 +721,14 @@ function beginWebRecognition(){
     if (!running || userStopping) return;     /* 멈춘 뒤 늦게 도착한 결과는 무시(상태표시 덮어쓰기·멈춤 방지) */
     D.mic = true; webNoProg = 0;              /* 결과가 오면 마이크·인식 정상(진행 중) */
     heardSpeech = true; clearTimeout(window.__deaf__);
-    /* 이 세션의 '전체 전사'(확정+중간)를 처음부터 다시 구성해 교체한다.
-       → 자라나는 중간 전사를 append 하지 않으므로(replace) 중복이 쌓이지 않는다(모바일 폭증 방지). */
-    var txt = '';
-    for (var i = 0; i < ev.results.length; i++){ txt += ' ' + ((ev.results[i][0] && ev.results[i][0].transcript) || ''); }
-    webSession = tokenizeWords(txt);
+    /* 이 세션의 '전체 전사'를 다시 구성한다. 안드로이드 크롬은 한 세션 안에서 결과를 '누적형'으로
+       보내는 경우가 많다(각 결과가 앞 내용을 통째로 다시 포함) → 단순히 이어 붙이면 중복 폭증.
+       그래서 결과들을 '겹침 제거(mergeOverlap)'로 합쳐, 누적형이든 조각형이든 중복 없이 한 벌로 만든다. */
+    var toks = [];
+    for (var i = 0; i < ev.results.length; i++){
+      toks = mergeOverlap(toks, tokenizeWords((ev.results[i][0] && ev.results[i][0].transcript) || ''));
+    }
+    webSession = toks;
     lastSegAt = Date.now();
     updateFollow();               /* ✨ '앞으로만' 따라가며 강조·자동 스크롤(떨림 없음) */
     showHeard();
