@@ -72,6 +72,9 @@ if (!window.SpeechSDK) {
   <button id="btnRec" disabled>준비 중…</button>
   <div class="lv"><i id="lvBar"></i></div>
   <div class="stat" id="stat">&nbsp;</div>
+  <button class="ghost" id="btnMore" style="display:none;border-color:#2f7d4f;color:#1f6b3f;font-weight:700">
+    ▶ 멈춘 곳부터 이어 읽기
+  </button>
   <button class="ghost" id="btnSkip" style="display:none;border-color:#e6c07a;color:#8a6100">
     낭독 없이 계속하기 →
   </button>
@@ -156,12 +159,22 @@ var deafTries = 0;           // 무음 감시 재확인 횟수(소리는 들어�
    교실 소음이 계속 인식돼 그게 안 먹는 드문 경우를 위해 '최대 녹음 시간(천장)'을 둔다.
    ★ 최대 녹음 시간은 지문 길이에 맞춰 자동 계산한다 → 짧은 지문은 짧게, 긴 챕터는 길게.
      그래서 정상 낭독은 아무리 길어도 중간에 끊기지 않는다. */
-var IDLE_STOP_MS   = 12000;  // 마지막 '인식된 구간' 뒤 12초간 새 구간이 없으면(다 읽고 멈춤) 자동 제출
+var IDLE_STOP_MS   = 8000;   // 마지막 '인식된 구간' 뒤 8초간 새 구간이 없으면(다 읽고 멈춤) 자동 제출
 var RA_MS_PER_WORD = 1500;   // 아주 느린 아이 기준 한 단어 낭독 시간(약 40단어/분)
 var RA_CAP_FACTOR  = 2.5;    // 예상 낭독 시간의 몇 배까지 허용할지(정상 낭독은 절대 안 끊기게 넉넉히)
 var RA_CAP_MIN     = 120000; // 최대 녹음 시간 하한(2분) — 짧은 지문도 최소 이만큼은 허용
 var RA_CAP_MAX     = 900000; // 최대 녹음 시간 상한(15분) — 아주 긴 챕터도 덮는 절대 천장
 var capMs = RA_CAP_MIN, lastSegAt = 0, capTimer = null;   // 이번 녹음의 최대 허용 시간 · 마지막 구간 시각 · 감시 타이머
+/* 무료(web) 모드 통과 기준 — 이 % 이상 '지문 순서대로' 읽어야 '낭독 완료'로 인정한다.
+   (아무렇게나 몇 단어만 중얼거리면 통과 안 됨. 브라우저 받아쓰기가 완벽하진 않으니 넉넉히 잡는다.)
+   학습앱 REC_INIT에서 minReadPct 로 바꿀 수 있다. */
+var RA_WEB_MIN = 70;
+/* 무료(web) '끝까지 읽었나' 기준 — 지문의 이 %까지 도달해야 통과(앞부분만 읽고 멈추는 것 방지). */
+var RA_WEB_FINISH = 85;
+/* Azure(유료) 녹음 횟수 상한 — '처음부터 다시'·'이어 읽기'로 새로 녹음을 시작하는 횟수를 제한해
+   무한 재녹음으로 과금이 늘어나는 것을 막는다. (자동 이어듣기는 한 번의 녹음 안이라 세지 않는다.)
+   학습앱 REC_INIT의 maxTries 로 바꿀 수 있다. 무료는 과금이 없어 적용하지 않는다. */
+var MAX_AZ_TRIES = 5, azTries = 0;
 var parentOrigin = null;
 
 var $ = function(id){ return document.getElementById(id); };
@@ -206,6 +219,10 @@ window.addEventListener('message', function(e){
     CFG.token = d.token || ''; CFG.region = d.region || 'koreacentral';
     CFG.ref = String(d.referenceText || '').trim(); CFG.label = d.label || '';
     CFG.engine = (d.engine === 'web') ? 'web' : (d.engine === 'azure' ? 'azure' : (CFG.token ? 'azure' : 'web'));
+    if (typeof d.minReadPct === 'number' && d.minReadPct >= 0 && d.minReadPct <= 100) RA_WEB_MIN = d.minReadPct;
+    if (typeof d.finishPct === 'number' && d.finishPct >= 0 && d.finishPct <= 100) RA_WEB_FINISH = d.finishPct;   // (무료) '끝까지' 기준
+    if (typeof d.idleStopSec === 'number' && d.idleStopSec >= 3 && d.idleStopSec <= 120) IDLE_STOP_MS = d.idleStopSec * 1000;   // (Azure) 방치 자동제출까지 대기 시간
+    if (typeof d.maxTries === 'number' && d.maxTries >= 1 && d.maxTries <= 20) MAX_AZ_TRIES = d.maxTries;   // (Azure) 녹음 횟수 상한
     D.token = !!CFG.token; drawDiag();
     if (CFG.label) $('subTitle').textContent = CFG.label;
     showRef(CFG.ref);
@@ -250,6 +267,7 @@ $('btnSkip').addEventListener('click', function(){
   failParent('skipped_by_student', '');
   window.close();
 });
+$('btnMore').addEventListener('click', resumeMore);   /* ▶ 멈춘 곳부터 이어 읽기 */
 
 /* 단독 테스트 모드 */
 $('btnSolo').addEventListener('click', function(){
@@ -285,9 +303,31 @@ function makeSpeechConfig(){
   return sc;
 }
 
+/* Azure 녹음 횟수 관문 — '처음부터 다시'·'이어 읽기'로 새 녹음을 시작할 때마다 센다.
+   상한을 넘으면 새 녹음을 막아 무한 재녹음 과금을 방지한다(무료는 과금이 없어 무제한). */
+function azTryGate(){
+  if (CFG.engine !== 'azure') return true;
+  if (azTries >= MAX_AZ_TRIES) {
+    $('stat').innerHTML = '<span style="color:#b23">정밀(Azure) 녹음 횟수(' + MAX_AZ_TRIES + '회)를 모두 사용했어요. '
+      + '지금 결과로 제출하거나 「낭독 없이 계속하기」로 진행해 주세요.</span>';
+    $('btnMore').style.display = 'none';
+    $('btnSkip').style.display = '';
+    $('btnRec').disabled = true;                 /* 더는 새 녹음 불가 → 과금 차단 */
+    return false;
+  }
+  azTries++;
+  return true;
+}
+function azLeftNote(){
+  if (CFG.engine !== 'azure') return '';
+  return ' · 정밀 녹음 ' + Math.max(0, MAX_AZ_TRIES - azTries) + '회 남음';
+}
+
 function startRec(){
   if (!canStart()) return;
+  if (!azTryGate()) return;             /* (Azure) 녹음 횟수 상한 확인 */
   segs = []; webTokens = []; $('cardRes').style.display='none';
+  $('btnMore').style.display = 'none';   /* 처음부터 다시 → 이어읽기 버튼 숨김 */
   FAILED = false;                       /* 다시 시도하면 판정을 초기화한다 */
   resumeCount = 0; userStopping = false; heardSpeech = false; deafTries = 0;
   $('stat').textContent = '마이크 권한을 확인하는 중…';
@@ -397,7 +437,10 @@ function startCapWatch(){
     if (!running) { clearInterval(capTimer); return; }
     var now = Date.now();
     if (now - startedAt > capMs) { autoFinish('max'); return; }                   /* 최대 시간(지문 길이 기준) 초과 → 강제 제출 */
-    if ((segs.length || webTokens.length) && (now - lastSegAt > IDLE_STOP_MS)) { autoFinish('idle'); }  /* 읽다가 오래 방치 → 자동 제출 */
+    /* 방치 자동 제출은 'Azure 과금 중단'용이다. 무료(web)는 과금이 없고, 브라우저 인식이
+       잠깐 멈추는 사이 '소리 없음'으로 오판해 읽는 학생을 끊어버리므로 적용하지 않는다.
+       → 무료 모드에서는 학생이 다 읽고 '■ 다 읽었어요'를 누를 때까지 기다린다. */
+    if (CFG.engine !== 'web' && (segs.length) && (now - lastSegAt > IDLE_STOP_MS)) { autoFinish('idle'); }  /* (Azure만) 읽다가 오래 방치 → 자동 제출 */
   }, 1000);
 }
 /* 상한에 걸려 자동으로 끝낼 때: 지금까지 읽은 것으로 채점하고 녹음을 확실히 멈춘다(오디오 과금 중단). */
@@ -536,29 +579,66 @@ function renderWeb(){
     return;
   }
   var r = aggregateWeb();
-  /* 무료 모드는 '발음의 질'을 못 잰다. 게이트/기록에 쓰는 점수는 끝까지 읽었는지(진행률)로 본다
-     — 받아쓰기 오류로 중간 단어가 안 맞아도 읽은 건 읽은 것으로 인정. */
-  var score = Math.max(r.completeness, r.reachedPct);
-  $('sPron').textContent = score;  $('sAcc').textContent = score;
-  $('sFlu').textContent = score;   $('sCom').textContent = score;
+  /* 무료 모드 통과 조건(두 가지 모두 충족해야 함):
+       ① 끝까지 읽었나   → 진행률(reachedPct) ≥ RA_WEB_FINISH (앞부분만 읽고 멈추는 것을 막는다)
+       ② 제대로 읽었나   → 전체 지문 대비 제대로 읽은 비율(completeness) ≥ RA_WEB_MIN
+     화면 점수는 '제대로 읽은 %'(completeness)로 보여 준다(진행률로 부풀리지 않는다). */
+  var correct  = r.completeness;      // 전체 지문 중 '제대로 읽은' 비율
+  var reached  = r.reachedPct;        // 어디까지 도달했나(끝까지 읽었는지)
+  var finished = reached >= RA_WEB_FINISH;
+  var pass     = finished && correct >= RA_WEB_MIN;
+  r.pass = pass; r.score = correct; r.finished = finished;
+  $('sPron').textContent = correct;  $('sAcc').textContent = correct;
+  $('sFlu').textContent = correct;   $('sCom').textContent = correct;
   /* 표시: 맞은 단어는 초록. '읽었지만 받아쓰기가 틀린' 중간 단어는 평범하게(빗금 X).
      마지막으로 읽은 지점 뒤(아직 안 읽은 부분)만 연하게 표시한다. */
   $('words').innerHTML = r.words.map(function(w){
     var cls = w.ok ? 'w-ok' : (w.unread ? 'w-om' : '');
     return cls ? ('<span class="'+cls+'">'+(w.Word||'')+'</span>') : (w.Word||'');
   }).join(' ');
-  $('raw').textContent = JSON.stringify({ engine:'web', 점수:score, 읽기일치율:r.completeness,
-    진행률:r.reachedPct, 맞은단어:r.matched, 지문단어:r.refWordCount, 말한단어:r.spokenWordCount, seconds:r.seconds }, null, 1);
+  $('raw').textContent = JSON.stringify({ engine:'web', 제대로읽음:correct, 진행률:reached, 끝까지:finished, 통과:pass,
+    기준_정확:RA_WEB_MIN, 기준_끝까지:RA_WEB_FINISH, 맞은단어:r.matched, 지문단어:r.refWordCount, 말한단어:r.spokenWordCount, seconds:r.seconds }, null, 1);
   $('cardRes').style.display = 'block';
-  var tail = (r.lastRefHit >= 0 && r.lastRefHit < r.refWordCount-1)
-    ? (' · 뒤쪽 ' + (r.refWordCount-1-r.lastRefHit) + '단어는 더 읽어도 좋아요') : '';
-  $('stat').textContent = (window.__autoNote__ ? (window.__autoNote__+' ') : '')
-    + '완료(무료) — 읽기 ' + score + '%' + tail + ' · ' + r.seconds + '초';
+  /* 통과해야만 제출 버튼이 보인다. 미달이면 숨겨서 '이어 읽기'나 '처음부터 다시'로 끝까지·또박또박 읽게 한다. */
+  if ($('btnSend')) $('btnSend').style.display = pass ? '' : 'none';
+  if (pass) {
+    $('stat').textContent = (window.__autoNote__ ? (window.__autoNote__+' ') : '')
+      + '잘 읽었어요! 완료(무료) — 제대로 읽기 ' + correct + '% · ' + r.seconds + '초';
+  } else if (!finished) {
+    var left = Math.max(0, r.refWordCount - 1 - r.lastRefHit);
+    $('stat').innerHTML = '<span style="color:#b23">아직 끝까지 안 읽었어요 — 뒤쪽 약 ' + left + '단어가 남았어요. '
+      + '「▶ 멈춘 곳부터 이어 읽기」로 끝까지 읽어 주세요.</span>';
+  } else {
+    $('stat').innerHTML = '<span style="color:#b23">끝까지 읽었지만 또박또박 다시 읽어 볼까요? '
+      + '지금 제대로 읽은 게 ' + correct + '% (기준 ' + RA_WEB_MIN + '%) — 「🎤 처음부터 다시」를 눌러 주세요.</span>';
+  }
   window.__autoNote__ = '';
   window.__LASTWEB__ = r;
+  if (webTokens.length && !FAILED) $('btnMore').style.display = '';   /* 멈춘 곳부터 이어 읽기 제공(아직 기준 미달이어도 더 읽어 채울 수 있게) */
 }
 
 function elapsed(){ return Math.round((Date.now()-startedAt)/1000); }
+
+/* ▶ 멈춘 곳부터 이어 읽기 — 이미 읽은 segs/webTokens 는 그대로 두고 인식만 다시 켜서 이어 쌓는다.
+   (처음부터 다시 읽을 필요 없이, 쉬었다가 멈춘 지점부터 계속 → 점수도 합산된다.) */
+function resumeMore(){
+  if (running) return;
+  if (CFG.engine !== 'web' && !segs.length) return;        /* 이어 읽을 앞부분이 있어야 한다(azure) */
+  if (!azTryGate()) return;             /* (Azure) 이어 읽기도 새 녹음이므로 횟수에 포함 */
+  FAILED = false;
+  $('cardRes').style.display = 'none';
+  $('btnMore').style.display = 'none';
+  $('btnSkip').style.display = 'none';
+  $('stat').textContent = '마이크 확인 중…';
+  navigator.mediaDevices.getUserMedia({ audio:true }).then(function(stream){
+    D.mic = true; drawDiag(); startLevelMeter(stream);
+    if (CFG.engine === 'web') beginWebRecognition(); else beginRecognition();   /* begin* 은 segs/webTokens 를 지우지 않는다 → 이어 쌓임 */
+    $('stat').textContent = '이어서 읽어 주세요 — 멈춘 곳부터 계속하면 됩니다. (다 읽으면 ■)';
+  }).catch(function(err){
+    D.mic = false; drawDiag();
+    failParent('mic_denied', err && err.name);
+  });
+}
 
 function stopRec(silent){
   userStopping = true;                 // 이 시점 이후의 취소 이벤트로는 이어듣기를 하지 않는다
@@ -576,7 +656,7 @@ function stopRec(silent){
     try { if (webRec) webRec.abort(); } catch(e){}   /* 확실히 종료(과금 없음·마이크 해제) */
     webRec = null;
     if (!silent) render();
-    $('btnRec').disabled = false; $('btnRec').textContent = '🎤 다시 녹음';
+    $('btnRec').disabled = false; $('btnRec').textContent = '🎤 처음부터 다시';
     return;
   }
   if (!recognizer) return;             /* 정밀(azure) 엔진 종료 */
@@ -587,8 +667,8 @@ function stopRec(silent){
     try { recognizer.close(); } catch(e){}
     recognizer = null;
     if (!silent) render();
-    $('btnRec').disabled = false; $('btnRec').textContent = '🎤 다시 녹음';
-  }, function(){ $('btnRec').disabled = false; $('btnRec').textContent = '🎤 다시 녹음'; });
+    $('btnRec').disabled = false; $('btnRec').textContent = '🎤 처음부터 다시';
+  }, function(){ $('btnRec').disabled = false; $('btnRec').textContent = '🎤 처음부터 다시'; });
 }
 
 /* ---------- 구간 결과 합산 ---------- */
@@ -642,18 +722,21 @@ function render(){
 
   $('cardRes').style.display = 'block';
   $('stat').textContent = (window.__autoNote__ ? (window.__autoNote__ + ' ') : '')
-    + '완료 — ' + r.seconds + '초 · ' + segs.length + '구간';
+    + '완료 — ' + r.seconds + '초 · ' + segs.length + '구간' + azLeftNote();
   window.__autoNote__ = '';
   window.__LAST__ = r;
+  /* 멈춘 곳부터 이어 읽기 — 녹음 횟수가 남아 있을 때만 제공(상한 넘으면 숨김) */
+  if (segs.length && !FAILED && azTries < MAX_AZ_TRIES) $('btnMore').style.display = '';
 }
 
 $('btnSend').addEventListener('click', function(){
   var payload;
   if (CFG.engine === 'web') {
     var w = window.__LASTWEB__; if (!w) return;
-    /* 무료 모드: 발음 질은 못 재므로 네 점수 모두 '읽기 점수'(진행률·관대 일치율 중 큰 값).
+    if (w.pass === false) return;   /* 기준 미달은 제출 불가(버튼도 숨겨져 있음) — 다시 읽게 한다 */
+    /* 무료 모드: 발음 질은 못 재므로 네 점수 모두 '제대로 읽은 비율'(completeness).
        '빠진 단어'는 받아쓰기 오류와 구분이 안 되므로, 실제로 '아직 안 읽은 뒤부분'만 기록한다. */
-    var sc = Math.max(w.completeness||0, w.reachedPct||0);
+    var sc = (w.score != null) ? w.score : (w.completeness || 0);
     payload = {
       ok:true, engine:'web', label:CFG.label,
       pron:sc, accuracy:sc, fluency:sc, completeness:sc,
