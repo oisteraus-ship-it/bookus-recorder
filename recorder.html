@@ -15,22 +15,34 @@ if (!window.SpeechSDK) {
 }
 </script>
 <style>
-  :root{--ac:#2e6b4f;--acd:#1f4c38;--bd:#d8dfe6;--bg:#f4f7fa;--warn:#b23;--ok:#137a3a}
+  :root{--ac:#2e6b4f;--acd:#1f4c38;--bd:#d8dfe6;--bg:#f4f7fa;--warn:#b23;--ok:#137a3a;--refpx:21px}
   *{box-sizing:border-box}
   body{margin:0;font-family:'Apple SD Gothic Neo','Noto Sans KR',-apple-system,sans-serif;
        background:var(--bg);color:#1a2230;padding:16px;-webkit-text-size-adjust:100%}
   h1{font-size:1.05rem;margin:0 0 4px;color:var(--acd)}
   .sub{font-size:.78rem;color:#7b8794;margin-bottom:12px}
   .card{background:#fff;border:1px solid var(--bd);border-radius:12px;padding:14px;margin-bottom:12px}
-  .ref{font-size:.95rem;line-height:1.75;background:#fbfaf3;border:1px solid #e6dfae;
-       border-radius:8px;padding:12px;max-height:190px;overflow:auto}
+  /* 본문: 크고(글자 크기 조절 가능) 줄 간격 넉넉하게 — 읽는 줄을 놓치지 않도록 */
+  .ref{position:relative;font-size:var(--refpx);line-height:2.15;letter-spacing:.2px;background:#fbfaf3;border:1px solid #e6dfae;
+       border-radius:8px;padding:16px 18px;max-height:52vh;overflow:auto;color:#15202e;scroll-behavior:smooth}
   .ref b{background:#fff3b0;border-radius:3px;padding:0 2px}
+  /* 따라읽기: 이미 읽은 단어는 연하게, 지금 읽을 단어는 밝게 강조 */
+  .rw{border-radius:5px;padding:0 1px;transition:background .12s,color .12s}
+  .rw.read{color:#9aa7b2}
+  .rw.here{background:#ffe066;color:#1a2230;box-shadow:0 0 0 3px #ffe066;font-weight:800}
+  /* 글자 크기 조절 바 */
+  .reftool{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-bottom:8px}
+  .reftool span{margin-right:auto;font-size:.76rem;color:#7b8794}
+  .reftool button{width:auto;padding:6px 12px;font-size:.9rem;font-weight:800;border:1.5px solid var(--bd);
+       background:#fff;color:#2e6b4f;border-radius:9px}
   button{width:100%;border:none;border-radius:11px;padding:14px;font-size:1rem;
          font-weight:800;cursor:pointer;font-family:inherit}
   #btnRec{background:var(--ac);color:#fff}
   #btnRec.rec{background:var(--warn)}
   #btnRec:disabled{background:#b7c3bf;cursor:not-allowed}
   .ghost{background:#fff;border:1.5px solid var(--bd);color:#55606e;margin-top:8px}
+  /* 녹음 조작 카드: 본문을 아래로 스크롤해도 '다 읽었어요' 버튼이 항상 화면에 보이게 */
+  .reccard{position:sticky;bottom:8px;z-index:5;box-shadow:0 -2px 10px rgba(20,40,30,.06)}
   .lv{height:8px;background:#e7ecf1;border-radius:4px;overflow:hidden;margin:10px 0 2px}
   .lv > i{display:block;height:100%;width:0;background:var(--ac);transition:width .08s}
   .stat{font-size:.82rem;color:#55606e;text-align:center;margin-top:6px;min-height:1.2em}
@@ -64,11 +76,16 @@ if (!window.SpeechSDK) {
 
 <!-- 지문 -->
 <div class="card">
+  <div class="reftool">
+    <span>글자 크기</span>
+    <button type="button" id="fMinus" aria-label="글자 작게">가−</button>
+    <button type="button" id="fPlus" aria-label="글자 크게">가＋</button>
+  </div>
   <div class="ref" id="ref">지문을 기다리는 중…</div>
 </div>
 
 <!-- 녹음 -->
-<div class="card">
+<div class="card reccard">
   <button id="btnRec" disabled>준비 중…</button>
   <div class="lv"><i id="lvBar"></i></div>
   <div class="stat" id="stat">&nbsp;</div>
@@ -223,6 +240,7 @@ window.addEventListener('message', function(e){
     if (typeof d.finishPct === 'number' && d.finishPct >= 0 && d.finishPct <= 100) RA_WEB_FINISH = d.finishPct;   // (무료) '끝까지' 기준
     if (typeof d.idleStopSec === 'number' && d.idleStopSec >= 3 && d.idleStopSec <= 120) IDLE_STOP_MS = d.idleStopSec * 1000;   // (Azure) 방치 자동제출까지 대기 시간
     if (typeof d.maxTries === 'number' && d.maxTries >= 1 && d.maxTries <= 20) MAX_AZ_TRIES = d.maxTries;   // (Azure) 녹음 횟수 상한
+    if (d.follow === false) FOLLOW_ON = false;   // 따라읽기(현재 단어 강조·자동 스크롤) 끄기 옵션(기본 켜짐)
     D.token = !!CFG.token; drawDiag();
     if (CFG.label) $('subTitle').textContent = CFG.label;
     showRef(CFG.ref);
@@ -241,7 +259,81 @@ window.addEventListener('message', function(e){
   }
 });
 
-function showRef(t){ $('ref').textContent = t || '(지문 없음)'; }
+/* 지문을 '단어 조각'으로 렌더 → 읽는 위치를 단어 단위로 따라가며 강조할 수 있게 한다. */
+var REF_WORDS = [];   // [{norm}] 지문 단어의 정규화형(정렬용)
+function showRef(t){
+  var box = $('ref');
+  var raw = String(t || '').trim();
+  if (!raw) { box.textContent = '(지문 없음)'; REF_WORDS = []; return; }
+  var parts = raw.split(/(\s+)/);   // 공백도 보존(원문 그대로 보이게)
+  REF_WORDS = [];
+  var html = '';
+  for (var i = 0; i < parts.length; i++) {
+    if (/^\s+$/.test(parts[i])) { html += parts[i]; continue; }
+    var n = normWord(parts[i]);
+    if (n) { html += '<span class="rw" data-i="' + REF_WORDS.length + '">' + escapeHtml(parts[i]) + '</span>'; REF_WORDS.push({ norm:n }); }
+    else   { html += escapeHtml(parts[i]); }
+  }
+  box.innerHTML = html;
+}
+function escapeHtml(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+/* 현재까지 '말한 단어'를 모아 정규화한 목록(무료=webTokens, 정밀=segs의 단어들) */
+function spokenNorms(){
+  if (CFG.engine === 'web') return webTokens.slice();
+  var out = [];
+  segs.forEach(function(nb){ (nb.Words || []).forEach(function(w){ var n = normWord(w.Word); if (n) out.push(n); }); });
+  return out;
+}
+/* ✨ 따라읽기 — 말한 단어를 지문에 순서대로 맞춰(그리디), 읽은 데까지 연하게·다음 단어를 밝게 + 자동 스크롤 */
+var FOLLOW_ON = true;
+function updateFollow(){
+  if (!FOLLOW_ON || !REF_WORDS.length) return;
+  var spans = $('ref').getElementsByClassName('rw');
+  if (!spans.length) return;
+  var sp = spokenNorms();
+  var j = 0, last = -1;
+  for (var i = 0; i < REF_WORDS.length; i++){
+    var hit = -1;
+    for (var k = j; k < sp.length; k++){ if (sp[k] === REF_WORDS[i].norm){ hit = k; break; } }
+    if (hit >= 0){ last = i; j = hit + 1; }
+  }
+  for (var m = 0; m < spans.length; m++){
+    spans[m].classList.toggle('read', m <= last);
+    spans[m].classList.toggle('here', m === last + 1);
+  }
+  var here = spans[last + 1];
+  if (here){
+    var box = $('ref');
+    var target = here.offsetTop - box.clientHeight / 2 + here.offsetHeight / 2;
+    box.scrollTop = Math.max(0, target);     // 현재 단어가 늘 화면 중앙에 오도록
+  }
+}
+function clearFollow(){
+  var spans = $('ref').getElementsByClassName('rw');
+  for (var m = 0; m < spans.length; m++){ spans[m].classList.remove('read','here'); }
+  try { $('ref').scrollTop = 0; } catch(e){}
+}
+
+/* ---------- 본문 글자 크기 조절(+/−) · 브라우저에 기억 ---------- */
+var REF_MIN = 16, REF_MAX = 40, REF_DEF = 21;
+function setRefPx(px){
+  px = Math.max(REF_MIN, Math.min(REF_MAX, px|0));
+  document.documentElement.style.setProperty('--refpx', px + 'px');
+  try { localStorage.setItem('bookusRefPx', String(px)); } catch(e){}
+  return px;
+}
+function curRefPx(){
+  var v = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--refpx'), 10);
+  return isNaN(v) ? REF_DEF : v;
+}
+(function initRefFont(){
+  var saved = REF_DEF;
+  try { var s = parseInt(localStorage.getItem('bookusRefPx'), 10); if (!isNaN(s)) saved = s; } catch(e){}
+  setRefPx(saved);
+  $('fPlus').addEventListener('click',  function(){ setRefPx(curRefPx() + 2); });
+  $('fMinus').addEventListener('click', function(){ setRefPx(curRefPx() - 2); });
+})();
 
 /* ---------- 실패를 학습앱에 알린다 (학생이 관문에 갇히지 않게) ----------
    이게 없으면 학습앱은 "학생이 그냥 창을 닫았다"로만 알게 되어
@@ -327,6 +419,7 @@ function startRec(){
   if (!canStart()) return;
   if (!azTryGate()) return;             /* (Azure) 녹음 횟수 상한 확인 */
   segs = []; webTokens = []; $('cardRes').style.display='none';
+  clearFollow();                        /* 처음부터 다시 → 따라읽기 강조 초기화 */
   $('btnMore').style.display = 'none';   /* 처음부터 다시 → 이어읽기 버튼 숨김 */
   FAILED = false;                       /* 다시 시도하면 판정을 초기화한다 */
   resumeCount = 0; userStopping = false; heardSpeech = false; deafTries = 0;
@@ -380,6 +473,7 @@ function buildRecognizer(){
       heardSpeech = true;
       lastSegAt = Date.now();          /* 마지막 채점 구간 시각 갱신(방치 자동제출 판단용) */
       clearTimeout(window.__deaf__);
+      updateFollow();                  /* ✨ 읽은 위치까지 따라가며 강조 + 자동 스크롤 */
       $('stat').textContent = '읽는 중… ' + segs.length + '구간 (' + elapsed() + '초) — 다 읽으면 ■ 버튼을 눌러요';
     } catch(err){}
   };
@@ -509,6 +603,7 @@ function beginWebRecognition(){
       if (r.isFinal) {
         pushWebTranscript(r[0] && r[0].transcript);
         lastSegAt = Date.now();
+        updateFollow();           /* ✨ 읽은 위치까지 따라가며 강조 + 자동 스크롤 */
         $('stat').textContent = '읽는 중… ' + webTokens.length + '단어 (' + elapsed() + '초) — 다 읽으면 ■ 버튼을 눌러요';
       } else if (running && !webTokens.length) {
         $('stat').textContent = '듣고 있어요… 계속 읽어 주세요.';
