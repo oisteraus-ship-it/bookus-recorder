@@ -26,10 +26,16 @@ if (!window.SpeechSDK) {
   .ref{position:relative;font-size:var(--refpx);line-height:2.15;letter-spacing:.2px;background:#fbfaf3;border:1px solid #e6dfae;
        border-radius:8px;padding:16px 18px;max-height:52vh;overflow:auto;color:#15202e;scroll-behavior:smooth}
   .ref b{background:#fff3b0;border-radius:3px;padding:0 2px}
+  /* 한 줄에 한 문장씩 */
+  .ref .sent{display:block;margin:0 0 .5em}
+  .ref .sent:last-child{margin-bottom:0}
   /* 따라읽기: 이미 읽은 단어는 연하게, 지금 읽을 단어는 밝게 강조 */
   .rw{border-radius:5px;padding:0 1px;transition:background .12s,color .12s}
   .rw.read{color:#9aa7b2}
   .rw.here{background:#ffe066;color:#1a2230;box-shadow:0 0 0 3px #ffe066;font-weight:800}
+  /* 진단: 브라우저가 실제로 들은 말(무료 모드) */
+  .heard{font-size:.74rem;color:#8a93a0;margin-top:6px;line-height:1.5;word-break:break-word}
+  .heard b{color:#55606e;font-weight:700}
   /* 글자 크기 조절 바 */
   .reftool{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-bottom:8px}
   .reftool span{margin-right:auto;font-size:.76rem;color:#7b8794}
@@ -89,6 +95,7 @@ if (!window.SpeechSDK) {
   <button id="btnRec" disabled>준비 중…</button>
   <div class="lv"><i id="lvBar"></i></div>
   <div class="stat" id="stat">&nbsp;</div>
+  <div class="heard" id="heard"></div>
   <button class="ghost" id="btnMore" style="display:none;border-color:#2f7d4f;color:#1f6b3f;font-weight:700">
     ▶ 멈춘 곳부터 이어 읽기
   </button>
@@ -259,64 +266,96 @@ window.addEventListener('message', function(e){
   }
 });
 
-/* 지문을 '단어 조각'으로 렌더 → 읽는 위치를 단어 단위로 따라가며 강조할 수 있게 한다. */
+/* 지문을 '한 줄에 한 문장씩' + 단어 조각으로 렌더 → 읽는 위치를 따라가며 강조. */
 var REF_WORDS = [];   // [{norm}] 지문 단어의 정규화형(정렬용)
 function showRef(t){
   var box = $('ref');
-  var raw = String(t || '').trim();
+  var raw = String(t || '').replace(/\s+/g, ' ').trim();
   if (!raw) { box.textContent = '(지문 없음)'; REF_WORDS = []; return; }
-  var parts = raw.split(/(\s+)/);   // 공백도 보존(원문 그대로 보이게)
+  /* 문장 단위로 끊는다(. ! ? 뒤에서). 각 문장은 한 줄(block)로 배치 → 읽는 줄을 놓치지 않게. */
+  var sentences = raw.match(/[^.!?]+[.!?]*\s*/g) || [raw];
   REF_WORDS = [];
   var html = '';
-  for (var i = 0; i < parts.length; i++) {
-    if (/^\s+$/.test(parts[i])) { html += parts[i]; continue; }
-    var n = normWord(parts[i]);
-    if (n) { html += '<span class="rw" data-i="' + REF_WORDS.length + '">' + escapeHtml(parts[i]) + '</span>'; REF_WORDS.push({ norm:n }); }
-    else   { html += escapeHtml(parts[i]); }
+  for (var s = 0; s < sentences.length; s++){
+    var words = sentences[s].trim().split(/\s+/).filter(Boolean);
+    if (!words.length) continue;
+    html += '<span class="sent">';
+    for (var w = 0; w < words.length; w++){
+      var n = normWord(words[w]);
+      if (n){ html += '<span class="rw" data-i="' + REF_WORDS.length + '">' + escapeHtml(words[w]) + '</span> '; REF_WORDS.push({ norm:n }); }
+      else  { html += escapeHtml(words[w]) + ' '; }
+    }
+    html += '</span>';
   }
   box.innerHTML = html;
 }
 function escapeHtml(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
-/* 현재까지 '말한 단어'를 모아 정규화한 목록(무료=webTokens, 정밀=segs의 단어들) */
-function spokenNorms(){
-  if (CFG.engine === 'web') {
-    var arr = webTokens.slice();
-    if (webInterim) { String(webInterim).split(/\s+/).forEach(function(w){ var n = normWord(w); if (n) arr.push(n); }); }  /* 중간 전사도 반영 → 하이라이트가 끊김 없이 따라감 */
-    return arr;
+/* 두 단어가 '사실상 같은가' — 무료 인식은 외국어 아동 발음을 조금씩 틀리게 받아쓰므로
+   완전히 똑같지 않아도(철자 1자 차이·앞부분 일치) 맞은 것으로 본다(관대 매칭). */
+function lev1(a, b){            // 편집거리 ≤ 1 인가(빠른 판정)
+  var la = a.length, lb = b.length;
+  if (Math.abs(la - lb) > 1) return false;
+  var i = 0, j = 0, diff = 0;
+  while (i < la && j < lb){
+    if (a[i] === b[j]){ i++; j++; continue; }
+    if (++diff > 1) return false;
+    if (la > lb) i++; else if (lb > la) j++; else { i++; j++; }
   }
-  var out = [];
-  segs.forEach(function(nb){ (nb.Words || []).forEach(function(w){ var n = normWord(w.Word); if (n) out.push(n); }); });
-  return out;
+  if (i < la || j < lb) diff++;
+  return diff <= 1;
 }
-/* ✨ 따라읽기 — 말한 단어를 지문에 순서대로 맞춰(그리디), 읽은 데까지 연하게·다음 단어를 밝게 + 자동 스크롤 */
-var FOLLOW_ON = true;
+function wordMatch(a, b){
+  if (a === b) return true;
+  var la = a.length, lb = b.length;
+  if (la >= 4 && lb >= 4 && (a.indexOf(b) === 0 || b.indexOf(a) === 0)) return true;   // 앞부분 일치(store/stor)
+  if (Math.max(la, lb) >= 4 && lev1(a, b)) return true;                                  // 철자 1자 차이(puppy/puppi)
+  return false;
+}
+/* 말한 토큰을 지문 단어에 순서대로(그리디·관대) 맞춘다. 공용 정렬기. */
+function alignWeb(sp){
+  var j = 0, matched = 0, last = -1, out = [];
+  for (var i = 0; i < REF_WORDS.length; i++){
+    var hit = -1, rn = REF_WORDS[i].norm;
+    for (var k = j; k < sp.length; k++){ if (wordMatch(sp[k], rn)){ hit = k; break; } }
+    if (hit >= 0){ matched++; last = i; j = hit + 1; out.push(true); }
+    else out.push(false);
+  }
+  return { matched:matched, lastRefHit:last, ok:out };
+}
+
+/* ✨ 따라읽기 — 확정된 말(webTokens)만으로 '앞으로만' 이동(되돌아가지 않음), 전진할 때만 부드럽게 스크롤. */
+var FOLLOW_ON = true, followPos = -1;
 function updateFollow(){
   if (!FOLLOW_ON || !REF_WORDS.length) return;
   var spans = $('ref').getElementsByClassName('rw');
   if (!spans.length) return;
-  var sp = spokenNorms();
-  var j = 0, last = -1;
-  for (var i = 0; i < REF_WORDS.length; i++){
-    var hit = -1;
-    for (var k = j; k < sp.length; k++){ if (sp[k] === REF_WORDS[i].norm){ hit = k; break; } }
-    if (hit >= 0){ last = i; j = hit + 1; }
-  }
+  var a = alignWeb(webTokens);           // 중간(interim) 전사는 하이라이트에 쓰지 않는다 → 떨림 방지
+  if (a.lastRefHit <= followPos) return; // 앞으로 나아갈 때만 갱신(뒤로·제자리면 아무것도 안 함)
+  followPos = a.lastRefHit;
   for (var m = 0; m < spans.length; m++){
-    spans[m].classList.toggle('read', m <= last);
-    spans[m].classList.toggle('here', m === last + 1);
+    spans[m].classList.toggle('read', m <= followPos);
+    spans[m].classList.toggle('here', m === followPos + 1);
   }
-  var here = spans[last + 1];
+  var here = spans[followPos + 1];
   if (here){
     var box = $('ref');
     var target = here.offsetTop - box.clientHeight / 2 + here.offsetHeight / 2;
-    box.scrollTop = Math.max(0, target);     // 현재 단어가 늘 화면 중앙에 오도록
+    box.scrollTop = Math.max(0, target);
   }
 }
 function clearFollow(){
+  followPos = -1;
   var spans = $('ref').getElementsByClassName('rw');
   for (var m = 0; m < spans.length; m++){ spans[m].classList.remove('read','here'); }
   try { $('ref').scrollTop = 0; } catch(e){}
+  if ($('heard')) $('heard').innerHTML = '';
+}
+/* 진단: 브라우저가 실제로 '들은 말'을 화면에 보여 준다(무료 모드). 점수가 낮을 때 원인 파악용. */
+function showHeard(){
+  if (CFG.engine !== 'web' || !$('heard')) return;
+  var t = webTokens.join(' ') + (webInterim ? (' ' + webInterim) : '');
+  $('heard').innerHTML = t ? ('<b>들린 말:</b> ' + escapeHtml(t)) : '';
 }
 
 /* ---------- 본문 글자 크기 조절(+/−) · 브라우저에 기억 ---------- */
@@ -614,7 +653,8 @@ function beginWebRecognition(){
     }
     webInterim = interim.trim();
     if (webTokens.length || webInterim) lastSegAt = Date.now();
-    updateFollow();               /* ✨ 확정+중간 단어까지 반영해 끊김 없이 따라가며 강조·자동 스크롤 */
+    updateFollow();               /* ✨ 확정 단어로 '앞으로만' 따라가며 강조·자동 스크롤(떨림 없음) */
+    showHeard();
     if (webTokens.length) $('stat').textContent = '읽는 중… ' + webTokens.length + '단어 (' + elapsed() + '초) — 다 읽으면 ■ 버튼을 눌러요';
     else if (running) $('stat').textContent = '듣고 있어요… 계속 읽어 주세요.';
   };
@@ -622,7 +662,7 @@ function beginWebRecognition(){
      크롬 연속 인식은 쉬는 지점마다 세션을 끝내는데, 그때 이 중간 말을 버리면
      실제로 읽은 단어가 통째로 사라진다(= 다 읽어도 점수 20~30%·하이라이트 되돌아감의 원인). */
   function commitWebInterim(){
-    if (webInterim){ pushWebTranscript(webInterim); webInterim = ''; lastSegAt = Date.now(); updateFollow(); }
+    if (webInterim){ pushWebTranscript(webInterim); webInterim = ''; lastSegAt = Date.now(); updateFollow(); showHeard(); }
   }
   webRec.onerror = function(ev){
     var err = (ev && ev.error) || '';
@@ -661,26 +701,19 @@ function beginWebRecognition(){
 function aggregateWeb(){
   var refRaw = String(CFG.ref||'').split(/\s+/).filter(Boolean);
   var ref = refRaw.map(function(w){ return { orig:w, norm:normWord(w) }; }).filter(function(x){ return x.norm; });
-  var sp = webTokens.slice();
-  /* 브라우저 무료 인식은 (1) 외국어 아동 발음을 자주 틀리게 받아쓰고, (2) 쉬는 사이 스스로 멈췄다
-     다시 켜지며 몇 단어를 흘린다. 그래서 '좁은 창 + 앞으로만' 정렬은 실제로 읽은 단어를 자꾸
-     놓친다. 여기서는 남은 전사 '전체'를 훑어 순서만 지키면 맞춘 것으로 보고(관대 정렬),
-     학생이 실제로 '어디까지' 읽었는지(lastRefHit)를 따로 잡아 그 뒤만 '아직 안 읽음'으로 본다. */
-  var j = 0, matched = 0, lastRefHit = -1;
+  /* 공용 관대 정렬기(alignWeb)로 채점 — 철자 1자 차이·앞부분 일치도 맞은 것으로 본다. */
+  var a = alignWeb(webTokens);
+  var lastRefHit = a.lastRefHit, matched = a.matched;
   var wordsOut = [];
   for (var i=0;i<ref.length;i++){
-    var hit = -1;
-    for (var k=j; k<sp.length; k++){ if (sp[k] === ref[i].norm){ hit = k; break; } }   // 남은 토큰 '전체'에서 탐색
-    if (hit >= 0){ matched++; j = hit + 1; lastRefHit = i; wordsOut.push({ Word:ref[i].orig, ok:true }); }
-    else { wordsOut.push({ Word:ref[i].orig, ok:false, reached:(i <= lastRefHit) }); }
+    if (a.ok[i]) wordsOut.push({ Word:ref[i].orig, ok:true });
+    else wordsOut.push({ Word:ref[i].orig, ok:false, unread:(lastRefHit<0 || i>lastRefHit) });
   }
-  /* reached=true 인 미매칭은 '읽긴 했는데 받아쓰기가 틀린' 쪽(무료의 한계) → 벌점·빗금 대상 아님.
-     reached=false(마지막 매칭 뒤) 미매칭만 '아직 안 읽은 뒤부분'으로 본다. */
-  wordsOut.forEach(function(w,i){ if(!w.ok && (lastRefHit<0 || i>lastRefHit)) w.unread = true; });
+  /* 마지막 매칭 뒤(아직 안 읽은 뒤부분)만 '빗금'. 중간 미매칭은 받아쓰기 오류로 보고 벌하지 않는다. */
   var completeness = ref.length ? Math.round(matched/ref.length*100) : 0;
   var reachedPct   = ref.length ? Math.round((lastRefHit+1)/ref.length*100) : 0;  // 끝까지 읽었는지(진행률)
   return { completeness:completeness, reachedPct:reachedPct, matched:matched, lastRefHit:lastRefHit,
-           refWordCount:ref.length, spokenWordCount:sp.length, words:wordsOut, seconds:elapsed() };
+           refWordCount:ref.length, spokenWordCount:webTokens.length, words:wordsOut, seconds:elapsed() };
 }
 function renderWeb(){
   if (!webTokens.length) {
