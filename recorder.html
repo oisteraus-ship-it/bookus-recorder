@@ -51,6 +51,10 @@ if (!window.SpeechSDK) {
   .reccard{position:sticky;bottom:8px;z-index:5;box-shadow:0 -2px 10px rgba(20,40,30,.06)}
   .lv{height:8px;background:#e7ecf1;border-radius:4px;overflow:hidden;margin:10px 0 2px}
   .lv > i{display:block;height:100%;width:0;background:var(--ac);transition:width .08s}
+  /* 무료 모드는 레벨미터 대신 '듣는 중' 맥박 표시(모바일 마이크 충돌 방지로 레벨미터를 안 씀) */
+  .lv.listening > i{width:100%;background:linear-gradient(90deg,#bfe3cd,#2e6b4f,#bfe3cd);
+       background-size:200% 100%;animation:lvpulse 1.1s linear infinite}
+  @keyframes lvpulse{0%{background-position:0% 0}100%{background-position:200% 0}}
   .stat{font-size:.82rem;color:#55606e;text-align:center;margin-top:6px;min-height:1.2em}
   .scores{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:10px 0}
   .sc{background:#f0f5fa;border:1px solid #cfdbe7;border-radius:9px;padding:9px 4px;text-align:center}
@@ -93,7 +97,7 @@ if (!window.SpeechSDK) {
 <!-- 녹음 -->
 <div class="card reccard">
   <button id="btnRec" disabled>준비 중…</button>
-  <div class="lv"><i id="lvBar"></i></div>
+  <div class="lv" id="lv"><i id="lvBar"></i></div>
   <div class="stat" id="stat">&nbsp;</div>
   <div class="heard" id="heard"></div>
   <button class="ghost" id="btnMore" style="display:none;border-color:#2f7d4f;color:#1f6b3f;font-weight:700">
@@ -174,6 +178,14 @@ function canStart(){
 var recognizer = null, running = false, startedAt = 0, levelTimer = null;
 var segs = [];               // (Azure) 구간별 결과 누적
 var webRec = null, webTokens = [], webInterim = '';   // (무료 web) 브라우저 인식기 · 확정 단어 누적 · 아직 확정 안 된 중간 전사
+var webNoProg = 0;   // 소리/단어가 전혀 안 들어온 채로 세션이 끊긴 횟수(모바일 인앱 브라우저 감지용)
+/* 카카오톡·네이버 앱 등 '인앱 브라우저(웹뷰)'에서는 브라우저 음성인식이 아예 안 되거나
+   권한 창이 반복해서 뜬다. 이런 환경을 미리 감지해 '크롬/사파리로 열기'를 안내한다. */
+function isInAppBrowser(){
+  var ua = (navigator.userAgent || '').toLowerCase();
+  return /kakaotalk|naver|whale\/|inapp|snapchat|line\/|instagram|fban|fbav|fb_iab|daumapps|everytimeapp|band\//.test(ua);
+}
+function isMobile(){ return /iphone|ipad|ipod|android/i.test(navigator.userAgent || ''); }
 var resumeCount = 0, userStopping = false, MAX_RESUME = 40;   // 침묵으로 세션이 끊길 때 조용히 이어 듣기
 var heardSpeech = false;     // 마이크로 실제 소리가 들어온 적이 있는가(무음 오판 방지)
 var deafTries = 0;           // 무음 감시 재확인 횟수(소리는 들어오는데 채점이 늦을 때 더 기다린다)
@@ -257,6 +269,11 @@ window.addEventListener('message', function(e){
       $('stat').innerHTML = '<span style="color:#b23">이 브라우저는 무료 음성인식을 지원하지 않습니다(크롬·사파리 권장). '
         + '아래 버튼으로 계속 진행하세요.</span>';
       $('btnSkip').style.display = '';
+    } else if (CFG.engine === 'web' && isInAppBrowser()) {
+      /* 카카오톡·네이버 앱 안(웹뷰)에서는 음성인식이 거의 안 된다 → 미리 안내 + 빠져나갈 길 제공 */
+      $('stat').innerHTML = '<span style="color:#b23">카카오톡·네이버 앱 안에서는 음성 낭독이 잘 안 돼요. '
+        + '오른쪽 위 메뉴(⋮/공유)에서 <b>Chrome</b>·<b>Safari로 열기</b>를 눌러 주세요. (그냥 진행하려면 아래 버튼)</span>';
+      $('btnSkip').style.display = '';
     } else {
       $('stat').textContent = '버튼을 누르고 지문을 소리 내어 읽어 주세요.'
         + (CFG.engine === 'web' ? ' (무료 모드: 읽기 일치율로 채점)' : '');
@@ -312,22 +329,39 @@ function wordMatch(a, b){
   if (Math.max(la, lb) >= 4 && lev1(a, b)) return true;                                  // 철자 1자 차이(puppy/puppi)
   return false;
 }
-/* 말한 토큰을 지문 단어에 순서대로(그리디·관대) 맞춘다. 공용 정렬기. */
+/* 말한 토큰을 지문 단어에 '순서대로' 최대한 맞춘다(LCS·최장 공통 부분수열).
+   그리디(앞으로만 훑기)는 'the·their·to·seeds'처럼 반복되는 단어에서 멀리 있는
+   같은 단어로 건너뛰어(overshoot) 그 뒤를 전부 놓치는 치명적 문제가 있다 →
+   순서를 지키면서 '가장 많이' 맞는 조합을 찾는 LCS로 그 문제를 없앤다. 관대 매칭 사용. */
 function alignWeb(sp){
-  var j = 0, matched = 0, last = -1, out = [];
-  for (var i = 0; i < REF_WORDS.length; i++){
-    var hit = -1, rn = REF_WORDS[i].norm;
-    for (var k = j; k < sp.length; k++){ if (wordMatch(sp[k], rn)){ hit = k; break; } }
-    if (hit >= 0){ matched++; last = i; j = hit + 1; out.push(true); }
-    else out.push(false);
+  var R = REF_WORDS.length, S = sp.length;
+  if (!R) return { matched:0, lastRefHit:-1, ok:[] };
+  /* LCS 길이표 L[i][j] + 매칭표 match[i][j] 를 한 번에 만든다. */
+  var L = [ new Int32Array(S + 1) ], match = [];
+  for (var i = 1; i <= R; i++){
+    var rn = REF_WORDS[i - 1].norm, pr = L[i - 1], crow = new Int32Array(S + 1), mr = new Uint8Array(S + 1);
+    for (var j = 1; j <= S; j++){
+      if (wordMatch(sp[j - 1], rn)){ mr[j] = 1; crow[j] = pr[j - 1] + 1; }
+      else crow[j] = pr[j] >= crow[j - 1] ? pr[j] : crow[j - 1];
+    }
+    L.push(crow); match.push(mr);
   }
-  return { matched:matched, lastRefHit:last, ok:out };
+  /* 역추적: 어느 ref 단어가 매칭에 쓰였는지 표시, 가장 뒤 매칭 index(last) 기록. */
+  var ok = new Array(R); for (var z = 0; z < R; z++) ok[z] = false;
+  var ri = R, sj = S, last = -1;
+  while (ri > 0 && sj > 0){
+    if (match[ri - 1][sj] && L[ri][sj] === L[ri - 1][sj - 1] + 1){ ok[ri - 1] = true; if (last < 0) last = ri - 1; ri--; sj--; }
+    else if (L[ri - 1][sj] >= L[ri][sj - 1]) ri--; else sj--;
+  }
+  return { matched:L[R][S], lastRefHit:last, ok:ok };
 }
 
 /* ✨ 따라읽기 — 확정된 말(webTokens)만으로 '앞으로만' 이동(되돌아가지 않음), 전진할 때만 부드럽게 스크롤. */
-var FOLLOW_ON = true, followPos = -1;
+var FOLLOW_ON = true, followPos = -1, lastFollowLen = -1;
 function updateFollow(){
   if (!FOLLOW_ON || !REF_WORDS.length) return;
+  if (webTokens.length === lastFollowLen) return;   // 새 확정 단어가 없으면 재계산 안 함(가벼움)
+  lastFollowLen = webTokens.length;
   var spans = $('ref').getElementsByClassName('rw');
   if (!spans.length) return;
   var a = alignWeb(webTokens);           // 중간(interim) 전사는 하이라이트에 쓰지 않는다 → 떨림 방지
@@ -345,7 +379,7 @@ function updateFollow(){
   }
 }
 function clearFollow(){
-  followPos = -1;
+  followPos = -1; lastFollowLen = -1;
   var spans = $('ref').getElementsByClassName('rw');
   for (var m = 0; m < spans.length; m++){ spans[m].classList.remove('read','here'); }
   try { $('ref').scrollTop = 0; } catch(e){}
@@ -393,7 +427,7 @@ function failParent(reason, detail){
   running = false;
   clearTimeout(window.__deaf__);
   clearInterval(capTimer);
-  stopLevelMeter();
+  stopLevelMeter(); $('lv').classList.remove('listening');
   var b = $('btnRec');
   b.classList.remove('rec'); b.disabled = false; b.textContent = '🎤 다시 시도';
   $('btnSkip').style.display = '';          // 학생이 빠져나갈 길을 항상 열어 둔다
@@ -465,16 +499,25 @@ function startRec(){
   clearFollow();                        /* 처음부터 다시 → 따라읽기 강조 초기화 */
   $('btnMore').style.display = 'none';   /* 처음부터 다시 → 이어읽기 버튼 숨김 */
   FAILED = false;                       /* 다시 시도하면 판정을 초기화한다 */
-  resumeCount = 0; userStopping = false; heardSpeech = false; deafTries = 0;
-  $('stat').textContent = '마이크 권한을 확인하는 중…';
+  resumeCount = 0; userStopping = false; heardSpeech = false; deafTries = 0; webNoProg = 0;
 
-  /* 권한을 먼저 명시적으로 받아 진단에 남긴다(iOS는 사용자 제스처 안에서 호출돼야 함).
-     무료(web)·정밀(azure) 둘 다 마이크 권한과 레벨미터는 동일하게 쓴다. */
+  if (CFG.engine === 'web') {
+    /* ★ 무료 모드: 레벨미터(getUserMedia)로 마이크를 먼저 붙잡으면, 모바일에서 브라우저
+       음성인식이 소리를 못 받는다(= 초록막대만 움직이고 '인식된 말 없음'). 또 iOS는
+       반드시 '탭 제스처 안에서' 인식을 시작해야 한다. 그래서 getUserMedia 없이,
+       인식기(webRec.start)가 직접 권한 요청·마이크 점유를 하도록 바로 시작한다. */
+    $('stat').textContent = '마이크 권한을 허용해 주세요…';
+    $('lv').classList.add('listening');          // 레벨미터 대신 '듣는 중' 표시
+    beginWebRecognition();
+    return;
+  }
+
+  /* 정밀(Azure): SDK가 마이크를 쓰므로 레벨미터와 함께 권한을 먼저 받는다. */
+  $('stat').textContent = '마이크 권한을 확인하는 중…';
   navigator.mediaDevices.getUserMedia({ audio:true }).then(function(stream){
     D.mic = true; drawDiag();
     startLevelMeter(stream);
-    if (CFG.engine === 'web') beginWebRecognition();
-    else beginRecognition();
+    beginRecognition();
   }).catch(function(err){
     D.mic = false; drawDiag();
     $('stat').innerHTML = '<span style="color:#b23">마이크를 열 수 없습니다: '
@@ -640,6 +683,7 @@ function beginWebRecognition(){
 
   webRec.onresult = function(ev){
     if (!running || userStopping) return;     /* 멈춘 뒤 늦게 도착한 결과는 무시(상태표시 덮어쓰기·멈춤 방지) */
+    D.mic = true; webNoProg = 0;              /* 결과가 오면 마이크·인식 정상(진행 중) */
     var interim = '';
     for (var i = ev.resultIndex; i < ev.results.length; i++){
       var r = ev.results[i];
@@ -674,6 +718,22 @@ function beginWebRecognition(){
     /* Web Speech는 침묵이 조금만 길어도 스스로 멈춘다. 학생이 아직 "다 읽었어요"를
        안 눌렀으면 조용히 다시 시작해 끊김 없이 이어 읽게 한다. */
     commitWebInterim();                       /* ★ 끊기기 직전 중간 전사를 확정 저장(유실 방지) */
+    /* 소리/단어가 전혀 안 들어온 채로 세션이 자꾸 끊기면 = 인식이 동작하지 않는 환경
+       (카카오톡·네이버 인앱 브라우저 등). 계속 재시도하면 권한 창만 반복해서 뜨므로 빨리 안내하고 멈춘다. */
+    if (running && !userStopping && !FAILED && !webTokens.length && !heardSpeech) {
+      webNoProg++;
+      if (webNoProg >= 3) {
+        $('lv').classList.remove('listening');
+        var msg = isInAppBrowser()
+          ? '이 앱(카카오톡·네이버 등) 안에서는 음성 낭독이 동작하지 않아요. 오른쪽 위 메뉴(⋮/공유)에서 <b>Chrome</b> 또는 <b>Safari로 열기</b>를 눌러 다시 해 주세요.'
+          : (isMobile()
+             ? '이 브라우저에서는 음성인식이 동작하지 않아요. <b>Chrome</b>(안드로이드) 또는 <b>Safari</b>(아이폰)에서 열어 주세요.'
+             : '음성인식이 시작되지 않았어요. 브라우저의 마이크 권한을 확인해 주세요.');
+        $('stat').innerHTML = '<span style="color:#b23">' + msg + '</span>';
+        failParent('web_unsupported', 'no speech engine (noProg)');
+        return;
+      }
+    }
     if (running && !userStopping && !FAILED && resumeCount < MAX_RESUME) {
       resumeCount++;
       try { webRec.start(); }
@@ -793,7 +853,7 @@ function stopRec(silent){
     /* 멈추는 순간 아직 확정 안 된 마지막 말(interim)을 잃지 않도록 먼저 저장 */
     if (webInterim){ pushWebTranscript(webInterim); webInterim = ''; }
     $('btnRec').textContent = '채점 중…'; $('btnRec').classList.remove('rec'); $('btnRec').disabled = true;
-    stopLevelMeter();
+    stopLevelMeter(); $('lv').classList.remove('listening');
     /* 멈추기 전에 모든 핸들러를 떼어낸다 — 종료 후 늦게 오는 결과/종료 이벤트가
        자동 재시작을 걸거나 "읽는 중…"으로 화면을 되돌려 멈춘 것처럼 보이게 하는 것을 막는다. */
     if (webRec) { try { webRec.onresult = null; webRec.onerror = null; webRec.onend = null; webRec.onspeechend = null; } catch(e){} }
