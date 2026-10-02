@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>마이크 전체화면 테스트</title>
+<style>
+  body{margin:0;font-family:'Apple SD Gothic Neo','Noto Sans KR',-apple-system,system-ui,sans-serif;
+       background:#f4f7fa;color:#1a2230;padding:18px;max-width:560px;margin:0 auto;-webkit-text-size-adjust:100%}
+  h1{font-size:1.2rem;margin:0 0 4px;color:#1f4c38}
+  .sub{font-size:.86rem;color:#6b7684;line-height:1.6;margin:0 0 16px}
+  .card{background:#fff;border:1px solid #d8dfe6;border-radius:12px;padding:16px;margin-bottom:14px}
+  .big{font-size:2.4rem;font-weight:800;text-align:center;letter-spacing:2px;color:#2e6b4f;margin:4px 0}
+  .lbl{font-size:.8rem;color:#7b8794;text-align:center;margin:0}
+  button{width:100%;border:none;border-radius:11px;padding:16px;font-size:1.05rem;font-weight:800;
+         cursor:pointer;font-family:inherit;color:#fff;background:#2e6b4f;margin-top:6px}
+  button.b2{background:#3a6ea5}
+  .out{margin-top:12px;font-size:.95rem;line-height:1.6;white-space:pre-wrap;word-break:break-word}
+  .ok{color:#1f7a3d;font-weight:800}
+  .bad{color:#b23;font-weight:800}
+  .meter{height:14px;background:#e7ecf1;border-radius:7px;overflow:hidden;margin-top:10px}
+  .meter > i{display:block;height:100%;width:0;background:#2e6b4f;transition:width .08s}
+  .note{font-size:.78rem;color:#8a93a0;line-height:1.6;margin-top:10px}
+  code{background:#eef2f6;padding:1px 5px;border-radius:5px;font-size:.85em}
+</style>
+</head>
+<body>
+  <h1>🎤 마이크 전체화면 테스트</h1>
+  <p class="sub">이 페이지는 <b>팝업이 아니라 전체화면(탭 전체)</b>에서 마이크가 리로드 없이 열리는지 확인하는 용도입니다.
+  아이패드/아이폰 사파리에서 <b>이 주소를 직접</b> 열어 주세요(학습앱을 거치지 말고).</p>
+
+  <div class="card">
+    <p class="lbl">세션 번호 (페이지가 리로드되면 이 숫자가 <b>바뀝니다</b>)</p>
+    <div class="big" id="sid">----</div>
+    <p class="note">버튼을 누른 뒤 이 숫자가 <b>그대로면</b> = 리로드 없음(정상). <b>바뀌면</b> = 전체화면에서도 리로드됨.</p>
+  </div>
+
+  <div class="card">
+    <b>① 마이크 권한 테스트 (가장 중요)</b>
+    <button id="b1">🎤 마이크 열기 (getUserMedia)</button>
+    <div class="meter"><i id="mbar"></i></div>
+    <div class="out" id="o1">버튼을 누르면 "마이크 허용" 창이 떠야 합니다. 허용 후 소리를 내면 위 막대가 움직입니다.</div>
+  </div>
+
+  <div class="card">
+    <b>② 무료 음성인식 테스트 (브라우저 내장)</b>
+    <button class="b2" id="b2">🗣️ 음성인식 시작 (webkitSpeechRecognition)</button>
+    <div class="out" id="o2">영어로 한 문장 말해 보세요. 받아쓰기가 나오면 지원됨, 오류가 나오면 미지원.</div>
+  </div>
+
+  <p class="note">※ 테스트 끝나면 결과(①·② 각각 어떻게 나왔는지 + 세션 번호가 바뀌었는지)를 알려 주세요.
+  이 한 번으로 "전체화면 방식으로 바꾸면 아이패드에서 녹음이 되는지"가 판가름 납니다.</p>
+
+<script>
+var $=function(id){return document.getElementById(id);};
+/* 세션 번호: 로드마다 새로 생성 → 리로드되면 값이 바뀐다 */
+$('sid').textContent = String(Math.floor(1000+Math.random()*9000));
+
+/* ① getUserMedia (마이크 권한 → 레벨미터) */
+$('b1').addEventListener('click', function(){
+  var o=$('o1'); o.innerHTML='마이크 여는 중… (권한 창을 허용해 주세요)';
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){
+    o.innerHTML='<span class="bad">❌ 이 브라우저는 getUserMedia를 지원하지 않습니다.</span>'; return;
+  }
+  navigator.mediaDevices.getUserMedia({audio:true}).then(function(stream){
+    o.innerHTML='<span class="ok">✅ 마이크 열림! (리로드 없이 성공)</span>\n소리를 내 보세요 — 막대가 움직이면 정상입니다.';
+    try{
+      var ac=new (window.AudioContext||window.webkitAudioContext)();
+      if(ac.state==='suspended')ac.resume();
+      var src=ac.createMediaStreamSource(stream), an=ac.createAnalyser(); an.fftSize=512; src.connect(an);
+      var buf=new Uint8Array(an.frequencyBinCount);
+      setInterval(function(){
+        an.getByteTimeDomainData(buf); var pk=0;
+        for(var i=0;i<buf.length;i++){var v=Math.abs(buf[i]-128)/128; if(v>pk)pk=v;}
+        $('mbar').style.width=Math.min(100,pk*220)+'%';
+      },80);
+    }catch(e){ o.innerHTML+='\n(레벨미터 오류: '+e+')'; }
+  }).catch(function(err){
+    o.innerHTML='<span class="bad">❌ 마이크 실패: '+(err&&err.name?err.name:err)+'</span>\n(권한 거부 또는 iOS 제한)';
+  });
+});
+
+/* ② webkitSpeechRecognition */
+$('b2').addEventListener('click', function(){
+  var o=$('o2');
+  var SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+  if(!SR){ o.innerHTML='<span class="bad">❌ 이 브라우저는 음성인식(webkitSpeechRecognition)을 지원하지 않습니다.</span>'; return; }
+  o.innerHTML='듣는 중… 영어로 한 문장 말해 보세요.';
+  try{
+    var rec=new SR(); rec.lang='en-US'; rec.interimResults=true; rec.continuous=false;
+    rec.onresult=function(ev){
+      var t=''; for(var i=0;i<ev.results.length;i++) t+=ev.results[i][0].transcript;
+      o.innerHTML='<span class="ok">✅ 인식됨:</span> '+t;
+    };
+    rec.onerror=function(ev){ o.innerHTML='<span class="bad">❌ 인식 오류: '+ev.error+'</span>'; };
+    rec.onend=function(){ o.innerHTML+='\n(인식 종료)'; };
+    rec.start();
+  }catch(e){ o.innerHTML='<span class="bad">❌ 시작 실패: '+e+'</span>'; }
+});
+</script>
+</body>
+</html>
