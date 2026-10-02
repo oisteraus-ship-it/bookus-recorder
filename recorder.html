@@ -99,7 +99,6 @@ if (!window.SpeechSDK) {
   <button id="btnRec" disabled>준비 중…</button>
   <div class="lv" id="lv"><i id="lvBar"></i></div>
   <div class="stat" id="stat">&nbsp;</div>
-  <div class="heard" id="heard"></div>
   <button class="ghost" id="btnMore" style="display:none;border-color:#2f7d4f;color:#1f6b3f;font-weight:700">
     ▶ 멈춘 곳부터 이어 읽기
   </button>
@@ -119,7 +118,7 @@ if (!window.SpeechSDK) {
   </div>
   <div class="words" id="words"></div>
   <button class="ghost" id="btnSend">이 결과로 제출하기 →</button>
-  <details><summary>원시 응답 보기(디버그)</summary><pre id="raw"></pre></details>
+  <details><summary>원시 응답 보기(디버그)</summary><div class="heard" id="heard"></div><pre id="raw"></pre></details>
 </div>
 
 <!-- 진단 -->
@@ -247,11 +246,8 @@ if (D.opener) {
   try { window.opener.postMessage({ type:'REC_READY' }, '*'); } catch(e){}
 }
 
-window.addEventListener('message', function(e){
-  if (!DEV_RELAX_ORIGIN && ALLOW_ORIGINS.indexOf(e.origin) === -1) return;
-  var d = e.data || {};
-  if (d.type === 'REC_INIT') {
-    parentOrigin = e.origin;
+/* REC_INIT(팝업) · 해시(iOS 전체화면) 공용 — 지문/엔진/토큰/기준을 받아 화면을 준비한다. */
+function applyInit(d){
     CFG.token = d.token || ''; CFG.region = d.region || 'koreacentral';
     CFG.ref = String(d.referenceText || '').trim(); CFG.label = d.label || '';
     CFG.engine = (d.engine === 'web') ? 'web' : (d.engine === 'azure' ? 'azure' : (CFG.token ? 'azure' : 'web'));
@@ -278,10 +274,56 @@ window.addEventListener('message', function(e){
       $('stat').textContent = '버튼을 누르고 지문을 소리 내어 읽어 주세요.'
         + (CFG.engine === 'web' ? ' (무료 모드: 읽기 일치율로 채점)' : '');
     }
-  } else if (d.type === 'REC_ERROR') {
+}
+window.addEventListener('message', function(e){
+  if (!DEV_RELAX_ORIGIN && ALLOW_ORIGINS.indexOf(e.origin) === -1) return;
+  var d = e.data || {};
+  if (d.type === 'REC_INIT') { parentOrigin = e.origin; applyInit(d); }
+  else if (d.type === 'REC_ERROR') {
     $('stat').innerHTML = '<span style="color:#b23">'+ (d.message||'오류') +'</span>';
   }
 });
+
+/* ───── iOS 전체화면(리다이렉트) 모드 ─────────────────────────────────────────
+   학습앱(GAS)이 팝업 대신 이 페이지로 '탭 전체'를 이동시켜 올 때, 필요한 정보를
+   주소(해시)로 받는다. 끝나면 돌아갈 주소(ret)와 재접속 토큰(rt)도 함께 온다.
+   해시는 클라이언트에만 남고 서버로 전송되지 않는다(토큰 노출 없음).            */
+var REDIRECT = false, RETURN_URL = '', RT = '';
+function b64urlDec(s){
+  try { s = String(s).replace(/-/g,'+').replace(/_/g,'/'); while (s.length % 4) s += '=';
+        return decodeURIComponent(escape(atob(s))); } catch(e){ return ''; }
+}
+function b64urlEnc(s){
+  try { return btoa(unescape(encodeURIComponent(String(s)))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''); }
+  catch(e){ return ''; }
+}
+function detectRedirect(){
+  var h = location.hash || '';
+  var m = h.match(/[#&]rec=([^&]+)/);
+  if (!m) return;
+  var cfg; try { cfg = JSON.parse(b64urlDec(decodeURIComponent(m[1]))); } catch(e){ return; }
+  if (!cfg || !cfg.ret) return;
+  REDIRECT = true; RETURN_URL = String(cfg.ret || ''); RT = String(cfg.rt || '');
+  /* 해시는 즉시 지워 둔다(새로고침·뒤로가기 꼬임 방지). 설정은 아래에서 바로 적용. */
+  try { history.replaceState(null, '', location.pathname + location.search); } catch(e){}
+  /* 전체화면 모드는 opener가 없어도 '단독 실행'이 아니다 — 단독 안내/토큰입력칸을 숨긴다. */
+  try { $('soloBox').style.display = 'none'; } catch(e){}
+  applyInit({
+    token: cfg.token || '', region: cfg.region || 'koreacentral',
+    referenceText: cfg.ref || '', label: cfg.label || '', engine: cfg.engine || 'web',
+    minReadPct: cfg.minReadPct, finishPct: cfg.finishPct,
+    idleStopSec: cfg.idleStopSec, maxTries: cfg.maxTries, follow: cfg.follow
+  });
+}
+
+/* 결과·취소·실패를 학습앱으로 되돌린다(전체화면 모드: 팝업이 아니라 탭 이동이므로 postMessage 대신 복귀). */
+function returnToApp(result){
+  var url = RETURN_URL;
+  if (!url) return;
+  var sep = (url.indexOf('?') === -1) ? '?' : '&';
+  url += sep + 'rt=' + encodeURIComponent(RT) + '&rar=' + encodeURIComponent(b64urlEnc(JSON.stringify(result || {})));
+  try { location.replace(url); } catch(e){ location.href = url; }
+}
 
 /* 지문을 '한 줄에 한 문장씩' + 단어 조각으로 렌더 → 읽는 위치를 따라가며 강조. */
 var REF_WORDS = [];   // [{norm}] 지문 단어의 정규화형(정렬용)
@@ -429,6 +471,7 @@ function curRefPx(){
 var FAILED = false;
 function failParent(reason, detail){
   if (FAILED) return; FAILED = true;
+  if (REDIRECT) { returnToApp({ ok:false, reason:reason, message:String(detail||'') }); return; }   // 전체화면 모드: 앱으로 복귀(관문 해제)
   if (D.opener) {
     try { window.opener.postMessage({ type:'REC_FAIL', reason:reason,
             message:String(detail||'') }, parentOrigin||'*'); } catch(e){}
@@ -444,6 +487,7 @@ function failParent(reason, detail){
   $('btnSkip').style.display = '';          // 학생이 빠져나갈 길을 항상 열어 둔다
 }
 $('btnSkip').addEventListener('click', function(){
+  if (REDIRECT) { returnToApp({ ok:false, reason:'skipped_by_student' }); return; }
   failParent('skipped_by_student', '');
   window.close();
 });
@@ -463,6 +507,7 @@ $('btnSolo').addEventListener('click', function(){
 /* ---------- 녹음 + 발음평가 ---------- */
 $('btnRec').addEventListener('click', function(){ running ? stopRec() : startRec(); });
 $('btnClose').addEventListener('click', function(){
+  if (REDIRECT) { returnToApp({ ok:false, reason:'cancelled' }); return; }
   if (D.opener) { try { window.opener.postMessage({type:'REC_CANCEL'}, parentOrigin||'*'); } catch(e){} }
   window.close();
 });
@@ -993,8 +1038,9 @@ $('btnSend').addEventListener('click', function(){
                    type:(w.PronunciationAssessment||{}).ErrorType||'' }; })
     };
   }
-  if (D.opener) { try { window.opener.postMessage({type:'REC_RESULT', payload:payload}, parentOrigin||'*'); } catch(e){} }
   $('btnSend').textContent = '전송됨 ✓';
+  if (REDIRECT) { returnToApp(payload); return; }   // 전체화면 모드: 앱으로 복귀하며 결과 전달
+  if (D.opener) { try { window.opener.postMessage({type:'REC_RESULT', payload:payload}, parentOrigin||'*'); } catch(e){} }
   setTimeout(function(){ window.close(); }, 500);
 });
 
@@ -1022,6 +1068,9 @@ function stopLevelMeter(){
   $('lvBar').style.width = '0';
   try { if (actx) actx.close(); } catch(e){}
 }
+
+/* 모든 상태변수·함수가 초기화된 뒤 실행 — iOS 전체화면 모드 감지(해시로 지문/토큰 받기). */
+detectRedirect();
 </script>
 </body>
 </html>
