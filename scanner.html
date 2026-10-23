@@ -22,11 +22,15 @@
   video{width:100%;height:100%;object-fit:cover;background:#000}
   .reticle{position:absolute;inset:14%;border:3px solid rgba(255,255,255,.85);border-radius:16px;box-shadow:0 0 0 2000px rgba(0,0,0,.22);pointer-events:none}
   .msg{margin-top:14px;font-size:1.02rem;color:#6b5f44;min-height:1.4em;line-height:1.45}
-  .fb{margin-top:12px;border-radius:14px;padding:16px 14px;display:none;border:1px solid #e6dcc4;background:#fffdf8}
+  /* 안내문구는 화면 맨 위 고정 배너로 — 카메라 크기와 상관없이 항상 잘 보이게 */
+  .fb{position:fixed;top:0;left:0;right:0;z-index:60;display:none;padding:16px 16px 18px;
+      background:#fffdf8;border-bottom:3px solid #e6dcc4;box-shadow:0 6px 22px rgba(0,0,0,.20);text-align:center;
+      animation:fbdrop .18s ease-out}
+  @keyframes fbdrop{from{transform:translateY(-16px);opacity:.3}to{transform:translateY(0);opacity:1}}
   .fb.show{display:block}
   .fb .ic{font-size:2.6rem;line-height:1}
-  .fb .big{font-size:1.5rem;font-weight:900;margin-top:4px;color:#1f2d45;word-break:keep-all}
-  .fb .sub{font-size:.98rem;color:#6b5f44;margin-top:4px;line-height:1.45;word-break:keep-all}
+  .fb .big{font-size:1.65rem;font-weight:900;margin-top:4px;color:#1f2d45;word-break:keep-all;line-height:1.25}
+  .fb .sub{font-size:1.12rem;font-weight:600;color:#5b4e34;margin-top:6px;line-height:1.5;word-break:keep-all}
   .fb.ok{background:rgba(16,122,96,.10)} .fb.ok .big{color:#0f766e}
   .fb.ret{background:rgba(14,116,170,.10)} .fb.ret .big{color:#0e74aa}
   .fb.err{background:rgba(180,55,46,.09)} .fb.err .big{color:#b4372e}
@@ -175,7 +179,7 @@
       beep(c==='ok'||c==='ret'?'ok':(c==='warn'?'warn':(c==='err'?'err':'ok')));
       if(d.nov){
         // 화면 전용(학생 확인 시 연체·대출중 안내) — 음성 없음, 목록 읽을 수 있게 더 오래 표시
-        setTimeout(hideFb, 6500);
+        setTimeout(hideFb, 9500);   // 학생 확인 시 연체·대출중 안내(화면 전용) — 더 오래
       } else {
         // 음성: 받은 피드백 내용으로 바로 판단(삑이 울리는 그 메시지라 안정적 — admin 재배포와 무관)
         var seq=[], say='';
@@ -194,7 +198,7 @@
         else if(big.indexOf('인식할 수 없')>=0){ seq=['badcode']; say='인식할 수 없는 코드입니다'; }
         else if(big.indexOf('대출자:')>=0){ seq=['cfm']; say='학생이 확인되었습니다'; }
         if(seq.length) playSeq(seq, say);
-        setTimeout(hideFb, (seq.indexOf('overdue')>=0||seq.indexOf('active')>=0)?6500:3500);
+        setTimeout(hideFb, (seq.indexOf('overdue')>=0||seq.indexOf('active')>=0)?9500:5000);
       }
     } else if(d.type==='SCAN_SAY'){
       /* 구버전 admin 호환: 위 피드백에서 이미 음성 처리하므로 중복 방지 위해 무시 */
