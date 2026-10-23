@@ -87,9 +87,15 @@
     $('fbIc').textContent=ic||''; $('fbBig').textContent=big||''; $('fbSub').textContent=sub||'';
   }
   function hideFb(){ $('fb').className='fb'; }
+  var _koVoice=null, _primed=false;
+  function pickVoice(){ try{ var vs=window.speechSynthesis.getVoices()||[]; _koVoice=null;
+    for(var i=0;i<vs.length;i++){ var lv=(vs[i].lang||'')+' '+(vs[i].name||''); if(/ko[-_]?|korean|한국/i.test(lv)){ _koVoice=vs[i]; break; } } }catch(e){} }
+  if('speechSynthesis' in window){ pickVoice(); try{ window.speechSynthesis.onvoiceschanged=pickVoice; }catch(e){} }
+  function primeSpeech(){ try{ if(_primed||!('speechSynthesis' in window))return; _primed=true; var u=new SpeechSynthesisUtterance(' '); u.volume=0; window.speechSynthesis.speak(u); }catch(e){} }
+  try{ ['touchend','click','keydown'].forEach(function(ev){ document.addEventListener(ev, primeSpeech, {passive:true}); }); }catch(e){}
   function speak(t){
     try{ if(!('speechSynthesis' in window) || !t) return;
-      var u=new SpeechSynthesisUtterance(String(t)); u.lang='ko-KR'; u.rate=1; u.pitch=1;
+      var u=new SpeechSynthesisUtterance(String(t)); u.lang='ko-KR'; if(_koVoice)u.voice=_koVoice; u.rate=1; u.pitch=1;
       window.speechSynthesis.cancel(); window.speechSynthesis.speak(u);
     }catch(e){}
   }
