@@ -87,6 +87,12 @@
     $('fbIc').textContent=ic||''; $('fbBig').textContent=big||''; $('fbSub').textContent=sub||'';
   }
   function hideFb(){ $('fb').className='fb'; }
+  function speak(t){
+    try{ if(!('speechSynthesis' in window) || !t) return;
+      var u=new SpeechSynthesisUtterance(String(t)); u.lang='ko-KR'; u.rate=1; u.pitch=1;
+      window.speechSynthesis.cancel(); window.speechSynthesis.speak(u);
+    }catch(e){}
+  }
   function beep(type){
     try{ audio=audio||new (window.AudioContext||window.webkitAudioContext)();
       var o=audio.createOscillator(), g=audio.createGain(); o.connect(g); g.connect(audio.destination);
@@ -109,6 +115,8 @@
       showFb(d.cls||'', d.icon||'', d.big||'', d.sub||'');
       beep(d.cls==='ok'||d.cls==='ret'?'ok':(d.cls==='warn'?'warn':(d.cls==='err'?'err':'ok')));
       setTimeout(hideFb, 3500);
+    } else if(d.type==='SCAN_SAY'){
+      speak(String(d.text||''));
     }
   });
 
